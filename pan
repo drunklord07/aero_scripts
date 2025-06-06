@@ -1,0 +1,370 @@
+import os
+import re
+import json
+import shutil
+from multiprocessing import Pool, Manager, cpu_count
+from docx import Document
+from docx.shared import RGBColor
+import xlsxwriter
+from tqdm import tqdm
+
+# === CONFIG ===
+INPUT_FILE    = "input.txt"                  # your Aerospike log file
+CHUNK_SIZE    = 2000                         # how many records to hand a worker at once
+OUTPUT_DOCX   = "aerospike_pan.docx"
+OUTPUT_XLSX   = "aerospike_pan.xlsx"
+TEMP_DIR      = "temp_aero_pan_parts"
+
+# Regex for PAN: exactly 5 uppercase letters, 4 digits, 1 uppercase letter,
+# not preceded or followed by [A-Z0-9]
+PAN_REGEX     = r'(?<![A-Z0-9])([A-Z]{5}[0-9]{4}[A-Z])(?![A-Z0-9])'
+PAN_BODY      = r'[A-Z]{5}[0-9]{4}[A-Z]'
+
+# Exact-match JSON for PAN (similar to KV_EXACT_RE logic)
+PAN_EXACT_RE  = re.compile(
+    rf'"([^"]+)"\s*:\s*"\[?({PAN_BODY})\]?"(?:\.)?|'           # "key":"[ABCDE1234F]" or "key":"ABCDE1234F" + optional dot
+    rf'"([^"]+)"\s*:\s*\[?({PAN_BODY})\]?(?=[\s,}}\]\.]|$)'    # "key":[ABCDE1234F] or "key":ABCDE1234F + lookahead
+)
+
+# XML fallback: <... name="pan" ... value="ABCDE1234F" ...>
+XML_NAMED_RE  = re.compile(
+    rf'<[^>]*\bname\s*=\s*"pan"[^>]*\bvalue\s*=\s*"({PAN_BODY})"[^>]*>',
+    flags=re.IGNORECASE
+)
+
+
+# === UTILITY: FLATTEN JSON ===
+def flatten_json(obj, prefix=""):
+    """
+    Recursively flatten a nested JSON object (dicts and lists).
+    Keys become "parent.child" or "array[0].child", etc.
+    """
+    flat = {}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            path = f"{prefix}{k}"
+            if isinstance(v, (dict, list)):
+                flat.update(flatten_json(v, path + "."))
+            elif isinstance(v, str) and v.strip().startswith(("{", "[")):
+                try:
+                    inner = json.loads(v)
+                except:
+                    flat[path] = v
+                else:
+                    flat.update(flatten_json(inner, path + "."))
+            else:
+                flat[path] = v
+    elif isinstance(obj, list):
+        for i, item in enumerate(obj):
+            flat.update(flatten_json(item, f"{prefix}[{i}]."))
+    return flat
+
+
+# === LOAD & GROUP RECORDS ===
+def load_records():
+    """
+    Read INPUT_FILE line by line. Whenever we see a line starting
+    with "Set Name:", we begin a new record. We count braces { / }
+    until they balance, then extract:
+       • set_name (string)
+       • key (string)
+       • raw_json (string, including the braces)
+    Any malformed header or unterminated JSON block increments load_warnings.
+    Returns:
+       records = [ (set_name, key, raw_json), … ]
+       load_warnings = <number of records skipped or malformed>
+    """
+    records = []
+    load_warnings = 0
+
+    buffer = []
+    in_record = False
+    brace_count = 0
+
+    header_re = re.compile(r"^Set\s+Name:\s*([^,]+),\s*Key:\s*(.+)", re.IGNORECASE)
+
+    with open(INPUT_FILE, "r", encoding="utf-8", errors="ignore") as f:
+        for raw_line in f:
+            line = raw_line.rstrip("\r\n")
+            # If we see a new "Set Name:" header
+            if line.startswith("Set Name:"):
+                if in_record and brace_count != 0:
+                    load_warnings += 1
+                buffer = [line]
+                brace_count = line.count("{") - line.count("}")
+                in_record = True
+
+            elif in_record:
+                buffer.append(line)
+                brace_count += line.count("{") - line.count("}")
+
+                if brace_count == 0:
+                    if "JSON Data:" not in buffer[0]:
+                        load_warnings += 1
+                        in_record = False
+                        continue
+
+                    header_part, json_start = buffer[0].split("JSON Data:", 1)
+                    m = header_re.match(header_part)
+                    if not m:
+                        load_warnings += 1
+                        in_record = False
+                        continue
+
+                    set_name = m.group(1).strip()
+                    key = m.group(2).strip().rstrip(",")
+                    json_lines = [json_start] + buffer[1:]
+                    raw_json = "\n".join(json_lines)
+
+                    records.append((set_name, key, raw_json))
+                    in_record = False
+
+            else:
+                load_warnings += 1
+
+        if in_record and brace_count != 0:
+            load_warnings += 1
+
+    return records, load_warnings
+
+
+# === SPLIT INTO CHUNKS ===
+def chunk_records(records):
+    """
+    Yield (records_chunk, chunk_index) in slices of CHUNK_SIZE.
+    """
+    for i in range(0, len(records), CHUNK_SIZE):
+        yield records[i : i + CHUNK_SIZE], (i // CHUNK_SIZE)
+
+
+# === PROCESS ONE CHUNK (PAN EXTRACTION) ===
+def process_chunk(args):
+    """
+    Each chunk is a list of (set_name, key, raw_json).
+    We’ll parse the JSON, flatten it, then look for any PAN values
+    in those flattened values only. If we find a match, capture:
+       (set_name, key, raw_json, matched_pan, field_path).
+
+    We also keep counters for:
+       • recs_seen: total records scanned in this chunk
+       • recs_with_pan: how many records had ≥1 PAN matches
+       • parse_failures: how many times JSON parsing failed
+    We produce a small .docx file with each match (colored runs)
+    and then append (matches_data, recs_seen, recs_with_pan, parse_failures)
+    into the shared result_list.
+    """
+    chunk, idx, result_list = args
+    pat_pan = re.compile(PAN_REGEX)
+
+    doc = Document()
+    matches_data = []
+    recs_seen = 0
+    recs_with_pan = 0
+    parse_failures = 0
+
+    for (set_name, key, raw_json) in chunk:
+        recs_seen += 1
+        # Attempt to parse JSON
+        try:
+            obj = json.loads(raw_json)
+            flat = flatten_json(obj)
+        except json.JSONDecodeError:
+            parse_failures += 1
+            continue
+
+        # Build a list of all JSON values (converted to str)
+        values_to_check = []
+        for v in flat.values():
+            if isinstance(v, (dict, list)):
+                values_to_check.append(json.dumps(v))
+            else:
+                values_to_check.append(str(v))
+
+        # XML fallback map: field="pan.value" if <... name="pan" value="ABCDE1234F" ...>
+        xml_map = {m.group(1): "pan.value" for m in XML_NAMED_RE.finditer(raw_json)}
+
+        # Scan raw_json for PANs, but only keep those in actual JSON values
+        raw_unesc = raw_json.replace('\\"', '"').replace("\\{", "{").replace("\\}", "}")
+        hits = list(pat_pan.finditer(raw_unesc))
+        if not hits:
+            continue
+
+        true_hits = []
+        for m in hits:
+            candidate = m.group(1)
+            if any(candidate in val for val in values_to_check):
+                true_hits.append((candidate, m.span(1)))
+        if not true_hits:
+            continue
+
+        recs_with_pan += 1
+
+        # Build a Word paragraph for this record
+        para = doc.add_paragraph(f"{set_name} | {key} | ")
+        last_pos = 0
+
+        true_hits_sorted = sorted(true_hits, key=lambda x: x[1][0])
+        fields = []
+
+        for pan, (s, e) in true_hits_sorted:
+            # Add text up to this match
+            if s > last_pos:
+                para.add_run(raw_unesc[last_pos : s])
+            # Add the matched PAN in red
+            run = para.add_run(pan)
+            run.font.color.rgb = RGBColor(255, 0, 0)
+            last_pos = e
+
+            # Determine which JSON field contains this PAN:
+            found_field = ""
+            # a) Exact match via flattened JSON
+            for path, v in flat.items():
+                if isinstance(v, (dict, list)):
+                    if pan in json.dumps(v):
+                        found_field = path
+                        break
+                else:
+                    if pan == str(v) or pan in str(v):
+                        found_field = path
+                        break
+
+            # b) If still not found, check exact JSON key:value or key:[value]
+            if not found_field:
+                fm = PAN_EXACT_RE.search(raw_unesc)
+                if fm:
+                    found_field = fm.group(1) or fm.group(3)
+
+            # c) XML fallback → field = "pan.value"
+            if not found_field and pan in xml_map:
+                found_field = xml_map[pan]
+
+            fields.append(found_field)
+
+        # Append any trailing text
+        if last_pos < len(raw_unesc):
+            para.add_run(raw_unesc[last_pos :])
+
+        # Append " | field: fld1, fld2 …" with each fld in red
+        para.add_run(" | field: ")
+        for i, fld in enumerate(fields):
+            if i:
+                para.add_run(", ")
+            fr = para.add_run(fld)
+            fr.font.color.rgb = RGBColor(255, 0, 0)
+
+        # Collect data for Excel
+        for (pan, _) in true_hits_sorted:
+            matches_data.append((set_name, key, raw_json, pan, fields.pop(0)))
+
+    # Save this chunk’s .docx if there were matches
+    if matches_data:
+        os.makedirs(TEMP_DIR, exist_ok=True)
+        doc.save(os.path.join(TEMP_DIR, f"chunk_{idx}.docx"))
+
+    result_list.append((matches_data, recs_seen, recs_with_pan, parse_failures))
+
+
+# === MERGE ALL PARTIAL .docx FILES ===
+def merge_word():
+    """
+    Take every chunk_*.docx in TEMP_DIR (in sorted order),
+    append its paragraphs into one big Document, preserving colors.
+    """
+    merged = Document()
+    for fn in tqdm(sorted(os.listdir(TEMP_DIR)), desc="Merging Word"):
+        if not fn.endswith(".docx"):
+            continue
+        sub = Document(os.path.join(TEMP_DIR, fn))
+        for para in sub.paragraphs:
+            out_p = merged.add_paragraph()
+            for run in para.runs:
+                nr = out_p.add_run(run.text)
+                if run.font.color and run.font.color.rgb:
+                    nr.font.color.rgb = run.font.color.rgb
+                nr.bold, nr.italic, nr.underline = run.bold, run.italic, run.underline
+    merged.save(OUTPUT_DOCX)
+
+
+# === WRITE EXCEL FILE ===
+def write_excel(all_matches):
+    """
+    Create OUTPUT_XLSX. Columns:
+      Set Name | Key | Full JSON | PAN | Field
+    Color the "PAN" cell in red whenever there was a match.
+    """
+    wb = xlsxwriter.Workbook(OUTPUT_XLSX)
+    ws = wb.add_worksheet()
+    red_fmt = wb.add_format({"font_color": "red"})
+
+    headers = ["Set Name", "Key", "Full JSON", "PAN", "Field"]
+    ws.write_row(0, 0, headers)
+    row = 1
+    for (set_name, key, raw_json, pan, field) in all_matches:
+        ws.write(row, 0, set_name)
+        ws.write(row, 1, key)
+        ws.write(row, 2, raw_json)
+        ws.write(row, 3, pan, red_fmt)
+        ws.write(row, 4, field)
+        row += 1
+
+    wb.close()
+
+
+# === MAIN PROGRAM ===
+if __name__ == "__main__":
+    # 1) Remove existing TEMP_DIR if present
+    if os.path.isdir(TEMP_DIR):
+        shutil.rmtree(TEMP_DIR)
+
+    # 2) Load & group records
+    print("Loading Aerospike records …")
+    records, load_warnings = load_records()
+    print(f"→ Total records loaded: {len(records)}  (warnings: {load_warnings})")
+
+    # 3) Split into chunks
+    chunks = list(chunk_records(records))
+
+    # 4) Process chunks in parallel
+    mgr = Manager()
+    results = mgr.list()
+    with Pool(min(cpu_count(), len(chunks))) as pool:
+        list(
+            tqdm(
+                pool.imap_unordered(
+                    process_chunk,
+                    [(chunk, idx, results) for (chunk, idx) in chunks],
+                ),
+                total=len(chunks),
+                desc="Processing chunks",
+            )
+        )
+
+    # 5) Aggregate results
+    all_matches = []
+    total_scanned = total_with_pan = total_parse_fail = 0
+    for (matches_data, recs_seen, recs_with_pan, parse_failures) in results:
+        all_matches.extend(matches_data)
+        total_scanned += recs_seen
+        total_with_pan += recs_with_pan
+        total_parse_fail += parse_failures
+
+    print(
+        f"Scanned {total_scanned} records, "
+        f"{total_with_pan} had ≥1 PAN matches, "
+        f"{len(all_matches)} total PAN hits, "
+        f"{total_parse_fail} JSON parse failures"
+    )
+
+    # 6) Merge all chunked .docx files, if any
+    if os.path.isdir(TEMP_DIR) and total_scanned > 0:
+        merge_word()
+
+    # 7) Write the Excel output
+    write_excel(all_matches)
+
+    # 8) Clean up
+    if os.path.isdir(TEMP_DIR):
+        shutil.rmtree(TEMP_DIR)
+
+    print(f"\n→ Word  saved to {OUTPUT_DOCX}")
+    print(f"→ Excel saved to {OUTPUT_XLSX}\n")
