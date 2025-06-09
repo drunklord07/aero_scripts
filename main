@@ -8,24 +8,27 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 from tqdm import tqdm
 
-def find_scripts(root_dir):
+def find_scripts():
     """
-    Return all .py files under root_dir (recursively),
+    Find all .py files in the current directory and subdirectories,
     excluding this driver script itself.
     """
-    pattern = os.path.join(root_dir, "**", "*.py")
-    all_py = glob.glob(pattern, recursive=True)
     me = os.path.abspath(__file__)
-    return sorted(f for f in all_py if os.path.abspath(f) != me)
+    scripts = []
+    for path in glob.glob("**/*.py", recursive=True):
+        full = os.path.abspath(path)
+        if full != me:
+            scripts.append(path)
+    return sorted(scripts)
 
 def run_script(path):
     """
-    Run `python path` and capture stdout/stderr.
-    Returns dict:
-      - basename: script name without .py
-      - returncode
-      - missing: list of missing outputs (docx, xlsx)
-      - log: combined output
+    Run `python path`, capture stdout/stderr.
+    Returns:
+      basename: filename without .py
+      returncode
+      missing: list of missing outputs (basename.docx / basename.xlsx)
+      log: combined stdout+stderr
     """
     basename = os.path.splitext(os.path.basename(path))[0]
     proc = subprocess.run(
@@ -39,8 +42,8 @@ def run_script(path):
         if not os.path.exists(f"{basename}.{ext}"):
             missing.append(f"{basename}.{ext}")
     return {
-        "script": path,
         "basename": basename,
+        "script": path,
         "returncode": proc.returncode,
         "missing": missing,
         "log": proc.stdout
@@ -48,15 +51,11 @@ def run_script(path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run all Python extractors in parallel, then merge their Excel outputs."
+        description="Run all extractor scripts in parallel and merge their Excel outputs."
     )
     parser.add_argument(
-        "-s", "--scripts-dir", default=".",
-        help="Directory under which to find all .py extractor scripts"
-    )
-    parser.add_argument(
-        "-c", "--combined", required=True,
-        help="Filename for the master Excel workbook"
+        "-c", "--combined", default="combined_output.xlsx",
+        help="Name of the master Excel file (default: combined_output.xlsx)"
     )
     parser.add_argument(
         "-j", "--max-parallel", type=int, default=3,
@@ -64,14 +63,12 @@ def main():
     )
     args = parser.parse_args()
 
-    # discover all .py scripts
-    scripts = find_scripts(args.scripts_dir)
-    print(f"Found {len(scripts)} Python scripts under {args.scripts_dir!r}.\n")
+    scripts = find_scripts()
+    print(f"Found {len(scripts)} Python scripts to run.\n")
 
     results = []
-    # run them in parallel
     with ThreadPoolExecutor(max_workers=args.max_parallel) as exe:
-        futures = { exe.submit(run_script, s): s for s in scripts }
+        futures = {exe.submit(run_script, s): s for s in scripts}
         for fut in tqdm(as_completed(futures), total=len(futures), desc="Running scripts"):
             res = fut.result()
             results.append(res)
@@ -85,26 +82,25 @@ def main():
     success = sum(1 for r in results if r["returncode"] == 0 and not r["missing"])
     print(f"\n→ Scripts run: {total}, succeeded: {success}, failed/skipped: {total - success}\n")
 
-    # collect all generated .xlsx in cwd
+    # Gather all .xlsx named after basenames in cwd
     excels = []
     for r in results:
-        if r["returncode"] == 0 and ".xlsx" not in r["missing"]:
+        if r["returncode"] == 0 and not r["missing"]:
             excels.append(f"{r['basename']}.xlsx")
 
     if not excels:
-        print("No Excel outputs found to merge. Exiting.")
+        print("No Excel files produced. Exiting.")
         return
 
-    # merge into one workbook
     print(f"Merging {len(excels)} Excel files into {args.combined} …")
     with pd.ExcelWriter(args.combined, engine="xlsxwriter") as writer:
         for f in tqdm(excels, desc="Merging sheets"):
             df = pd.read_excel(f)
-            sheet = os.path.splitext(os.path.basename(f))[0][:31]  # Excel sheet name limit
+            sheet = os.path.splitext(os.path.basename(f))[0][:31]
             df.to_excel(writer, sheet_name=sheet, index=False)
 
-    print(f"\n✅ Master workbook created: {args.combined}")
-    print("Individual .docx and .xlsx files remain in the current directory.")
-    
+    print(f"\n✅ Master workbook: {args.combined}")
+    print("All individual .docx/.xlsx outputs remain in this folder.")
+
 if __name__ == "__main__":
     main()
