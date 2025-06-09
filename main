@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 import glob
+import re
 import subprocess
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -9,98 +10,122 @@ import pandas as pd
 from tqdm import tqdm
 
 def find_scripts():
-    """
-    Find all .py files in the current directory and subdirectories,
-    excluding this driver script itself.
-    """
+    """Find all .py files under cwd (recursive), excluding this driver."""
     me = os.path.abspath(__file__)
     scripts = []
-    for path in glob.glob("**/*.py", recursive=True):
-        full = os.path.abspath(path)
+    for fn in glob.glob("**/*.py", recursive=True):
+        full = os.path.abspath(fn)
         if full != me:
-            scripts.append(path)
+            scripts.append(fn)
     return sorted(scripts)
+
+def parse_expected_outputs(script_path):
+    """
+    Read the script and extract OUTPUT_XLSX and OUTPUT_DOCX assignments.
+    Fallback to <basename>.xlsx/.docx if not found.
+    """
+    basename = os.path.splitext(os.path.basename(script_path))[0]
+    txt = open(script_path, encoding="utf-8", errors="ignore").read()
+    m_x = re.search(r'OUTPUT_XLSX\s*=\s*["\'](.+?\.xlsx)["\']', txt)
+    m_d = re.search(r'OUTPUT_DOCX\s*=\s*["\'](.+?\.docx)["\']', txt)
+    return (m_x.group(1) if m_x else f"{basename}.xlsx",
+            m_d.group(1) if m_d else f"{basename}.docx")
 
 def run_script(path):
     """
-    Run `python path`, capture stdout/stderr.
-    Returns:
-      basename: filename without .py
-      returncode
-      missing: list of missing outputs (basename.docx / basename.xlsx)
-      log: combined stdout+stderr
+    Run `python path` in its own folder. Return metadata including
+    expected output names and any missing files.
     """
+    script_dir = os.path.dirname(path) or "."
     basename = os.path.splitext(os.path.basename(path))[0]
+    expected_xlsx, expected_docx = parse_expected_outputs(path)
+
+    # execute
     proc = subprocess.run(
-        ["python", path],
+        ["python", os.path.basename(path)],
+        cwd=script_dir,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
     )
+
+    # check for outputs
     missing = []
-    for ext in ("docx", "xlsx"):
-        if not os.path.exists(f"{basename}.{ext}"):
-            missing.append(f"{basename}.{ext}")
+    for fn in (expected_docx, expected_xlsx):
+        if not os.path.exists(os.path.join(script_dir, fn)):
+            missing.append(fn)
+
     return {
+        "path": path,
+        "dir": script_dir,
         "basename": basename,
-        "script": path,
         "returncode": proc.returncode,
-        "missing": missing,
-        "log": proc.stdout
+        "log": proc.stdout,
+        "expected_xlsx": expected_xlsx,
+        "expected_docx": expected_docx,
+        "missing": missing
     }
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Run all extractor scripts in parallel and merge their Excel outputs."
+    p = argparse.ArgumentParser(
+        description="Run all extractor scripts in parallel, then merge their Excels."
     )
-    parser.add_argument(
+    p.add_argument(
         "-c", "--combined", default="combined_output.xlsx",
         help="Name of the master Excel file (default: combined_output.xlsx)"
     )
-    parser.add_argument(
+    p.add_argument(
         "-j", "--max-parallel", type=int, default=3,
-        help="How many scripts to run at once"
+        help="Number of scripts to run concurrently (default: 3)"
     )
-    args = parser.parse_args()
+    args = p.parse_args()
 
     scripts = find_scripts()
-    print(f"Found {len(scripts)} Python scripts to run.\n")
+    print(f"Discovered {len(scripts)} Python scripts.\n")
 
     results = []
-    with ThreadPoolExecutor(max_workers=args.max_parallel) as exe:
-        futures = {exe.submit(run_script, s): s for s in scripts}
+    with ThreadPoolExecutor(max_workers=args.max_parallel) as pool:
+        futures = { pool.submit(run_script, s): s for s in scripts }
         for fut in tqdm(as_completed(futures), total=len(futures), desc="Running scripts"):
             res = fut.result()
             results.append(res)
+
             if res["returncode"] != 0:
-                print(f"\n[ERROR] {res['script']} failed (exit {res['returncode']}):")
+                print(f"\n[ERROR] {res['path']} exited {res['returncode']}")
                 print(res["log"])
             elif res["missing"]:
-                print(f"[WARN] {res['script']} missing outputs: {res['missing']}")
+                print(f"[WARN] {res['path']} missing: {res['missing']}")
+            else:
+                # move the files back to cwd
+                for fn in (res["expected_docx"], res["expected_xlsx"]):
+                    src = os.path.join(res["dir"], fn)
+                    dst = os.path.join(os.getcwd(), fn)
+                    if os.path.exists(src):
+                        os.replace(src, dst)
 
     total = len(results)
-    success = sum(1 for r in results if r["returncode"] == 0 and not r["missing"])
-    print(f"\n→ Scripts run: {total}, succeeded: {success}, failed/skipped: {total - success}\n")
+    succeeded = sum(1 for r in results if r["returncode"] == 0 and not r["missing"])
+    print(f"\n→ Scripts run: {total}, succeeded: {succeeded}, failed/skipped: {total - succeeded}\n")
 
-    # Gather all .xlsx named after basenames in cwd
-    excels = []
-    for r in results:
-        if r["returncode"] == 0 and not r["missing"]:
-            excels.append(f"{r['basename']}.xlsx")
-
+    # gather the actual xlsx files
+    excels = [
+        r["expected_xlsx"]
+        for r in results
+        if r["returncode"] == 0 and not r["missing"]
+        and os.path.exists(r["expected_xlsx"])
+    ]
     if not excels:
-        print("No Excel files produced. Exiting.")
+        print("No Excel files to merge. Exiting.")
         return
 
-    print(f"Merging {len(excels)} Excel files into {args.combined} …")
+    print(f"Merging {len(excels)} Excel files into '{args.combined}' …")
     with pd.ExcelWriter(args.combined, engine="xlsxwriter") as writer:
         for f in tqdm(excels, desc="Merging sheets"):
             df = pd.read_excel(f)
             sheet = os.path.splitext(os.path.basename(f))[0][:31]
             df.to_excel(writer, sheet_name=sheet, index=False)
 
-    print(f"\n✅ Master workbook: {args.combined}")
-    print("All individual .docx/.xlsx outputs remain in this folder.")
+    print(f"\n✅ Master workbook created: {args.combined}")
 
 if __name__ == "__main__":
     main()
