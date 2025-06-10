@@ -10,13 +10,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import pandas as pd
 
-# --- ensure our own stdout/stderr can handle any Unicode ---
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+# Force our prints to ASCII-only so we never blow up on Windows codepages
+def safe_print(*args, **kwargs):
+    msg = " ".join(str(a) for a in args)
+    # strip non-ASCII
+    msg = msg.encode("ascii", "ignore").decode("ascii")
+    print(msg, **kwargs)
 
 def find_scripts():
-    """Recursively find all .py files except this driver."""
     me = os.path.abspath(__file__)
     return sorted(
         fn for fn in glob.glob("**/*.py", recursive=True)
@@ -24,21 +25,14 @@ def find_scripts():
     )
 
 def parse_expected_outputs(path):
-    """Peek for OUTPUT_XLSX / OUTPUT_DOCX or fallback to basename."""
     base = os.path.splitext(os.path.basename(path))[0]
     text = open(path, encoding="utf-8", errors="ignore").read()
     m_x = re.search(r'OUTPUT_XLSX\s*=\s*["\'](.+?\.xlsx)["\']', text)
     m_d = re.search(r'OUTPUT_DOCX\s*=\s*["\'](.+?\.docx)["\']', text)
-    return (
-        m_x.group(1) if m_x else f"{base}.xlsx",
-        m_d.group(1) if m_d else f"{base}.docx"
-    )
+    return (m_x.group(1) if m_x else f"{base}.xlsx",
+            m_d.group(1) if m_d else f"{base}.docx")
 
 def run_script(path):
-    """
-    Run the extractor with UTF-8 stdio enforced.
-    Returns metadata including missing outputs and full log.
-    """
     exp_xlsx, exp_docx = parse_expected_outputs(path)
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
@@ -47,12 +41,13 @@ def run_script(path):
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        env=env
+        env=env,
+        errors="replace"
     )
     missing = [fn for fn in (exp_xlsx, exp_docx) if not os.path.isfile(fn)]
     return {
-        "path": path,
         "basename": os.path.splitext(os.path.basename(path))[0],
+        "path": path,
         "returncode": proc.returncode,
         "expected_xlsx": exp_xlsx,
         "expected_docx": exp_docx,
@@ -61,15 +56,13 @@ def run_script(path):
     }
 
 def main():
-    p = argparse.ArgumentParser(description="Run all extractor scripts and merge XLSX outputs.")
-    p.add_argument("-c", "--combined", default="combined_output.xlsx",
-                   help="Master Excel filename (default: combined_output.xlsx)")
-    p.add_argument("-j", "--max-parallel", type=int, default=3,
-                   help="How many scripts to run at once")
+    p = argparse.ArgumentParser()
+    p.add_argument("-c", "--combined", default="combined_output.xlsx")
+    p.add_argument("-j", "--max-parallel", type=int, default=3)
     args = p.parse_args()
 
     scripts = find_scripts()
-    print(f"Found {len(scripts)} scripts to run.\n")
+    safe_print(f"Found {len(scripts)} scripts to run.\n")
 
     out_dir = "outputs"
     if os.path.isdir(out_dir):
@@ -87,40 +80,46 @@ def main():
             results.append(res)
             name = res["basename"]
             if res["returncode"] != 0:
-                print(f"[ERROR] {name} exited {res['returncode']}")
-                print(res["log"])
+                safe_print(f"[ERROR] {name} exited {res['returncode']}")
+                safe_print(res["log"])
             elif res["missing"]:
-                print(f"[WARN] {name} missing outputs: {res['missing']}")
+                safe_print(f"[WARN] {name} missing outputs: {res['missing']}")
             else:
-                # copy artifacts
+                # copy outputs if they exist
                 for fn in (res["expected_docx"], res["expected_xlsx"]):
-                    if os.path.exists(fn):
-                        shutil.copy(fn, os.path.join(out_dir, fn))
+                    src = fn
+                    dst = os.path.join(out_dir, fn)
+                    try:
+                        if os.path.exists(src):
+                            shutil.copy(src, dst)
+                    except FileNotFoundError:
+                        # temp dirs or outputs may not exist for some scripts
+                        continue
 
     total = len(results)
-    succeeded = sum(1 for r in results if r["returncode"] == 0 and not r["missing"])
-    print(f"\nScripts run: {total}, succeeded: {succeeded}, failed/skipped: {total-succeeded}\n")
+    ok = sum(1 for r in results if r["returncode"] == 0 and not r["missing"])
+    safe_print(f"\nScripts run: {total}, succeeded: {ok}, failed/skipped: {total-ok}\n")
 
+    # collect XLSX files
     excels = [
         os.path.join(out_dir, r["expected_xlsx"])
         for r in results
         if r["returncode"] == 0 and not r["missing"]
-        and os.path.isfile(os.path.join(out_dir, r["expected_xlsx"]))
     ]
-    if not excels:
-        print("No Excel files to merge. Exiting.")
-        sys.exit(1)
-
-    print(f"Merging {len(excels)} Excel files into '{args.combined}' …")
+    safe_print(f"Merging {len(excels)} Excel files into {args.combined} …")
     with pd.ExcelWriter(args.combined, engine="xlsxwriter") as writer:
         for f in tqdm(excels, desc="Merging sheets", ascii=True):
-            df = pd.read_excel(f)
+            try:
+                df = pd.read_excel(f)
+            except Exception as e:
+                safe_print(f"[WARN] Skipping invalid Excel {f}: {e}")
+                continue
             sheet = os.path.splitext(os.path.basename(f))[0][:31]
             df.to_excel(writer, sheet_name=sheet, index=False)
 
-    print(f"\nMaster workbook created: {args.combined}")
-    print(f"Outputs folder: {out_dir}")
-    sys.exit(0 if succeeded == total else 1)
+    safe_print(f"\nMaster workbook created: {args.combined}")
+    safe_print(f"Outputs directory: ./{out_dir}")
+    sys.exit(0 if ok == total else 1)
 
 if __name__ == "__main__":
     main()
