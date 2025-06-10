@@ -17,7 +17,7 @@ OUTPUT_XLSX  = "aerospike_mobiles.xlsx"
 TEMP_DIR     = "temp_aero_parts"
 MOBILE_REGEX = r'(?<!\d)((?:\+91[\-\s]?|91[\-\s]?|0)?[6-9]\d{9})(?!\d)'
 
-# === FLATTEN JSON ===
+
 def flatten_json(obj, prefix=""):
     flat = {}
     if isinstance(obj, dict):
@@ -32,14 +32,14 @@ def flatten_json(obj, prefix=""):
             flat.update(flatten_json(item, f"{prefix}[{i}]."))
     return flat
 
-# === LOAD & GROUP RECORDS ===
+
 def load_records():
     """
     Single-pass header + brace-scanning loader.
     Returns:
       records: list of (set_name, key, raw_json)
-      load_warnings: int
-      skipped_headers: list of header texts that failed to parse
+      warnings: int
+      skipped: list of header snippets that failed
     """
     text = open(INPUT_FILE, encoding="utf-8", errors="ignore").read()
     header_pat = re.compile(
@@ -51,7 +51,6 @@ def load_records():
 
     records, skipped, warnings = [], [], 0
     pos, L = 0, len(text)
-
     while True:
         m = header_pat.search(text, pos)
         if not m:
@@ -61,19 +60,19 @@ def load_records():
         brace_i  = text.find("{", m.end())
         if brace_i < 0:
             warnings += 1
-            skipped.append((set_name, key, "no JSON opening brace"))
+            skipped.append(text[m.start():m.end()])
             pos = m.end()
             continue
-        count, i = 1, brace_i + 1
-        while i < L and count > 0:
+        cnt, i = 1, brace_i + 1
+        while i < L and cnt:
             if text[i] == "{":
-                count += 1
+                cnt += 1
             elif text[i] == "}":
-                count -= 1
+                cnt -= 1
             i += 1
-        if count != 0:
+        if cnt != 0:
             warnings += 1
-            skipped.append((set_name, key, "unbalanced JSON braces"))
+            skipped.append(text[m.start():m.end()])
             pos = m.end()
             continue
         raw_json = text[brace_i:i]
@@ -82,17 +81,19 @@ def load_records():
 
     return records, warnings, skipped
 
-# === CHUNK RECORDS ===
+
 def chunk_records(records):
     for idx in range(0, len(records), CHUNK_SIZE):
         yield records[idx:idx+CHUNK_SIZE], idx//CHUNK_SIZE
 
-# === PROCESS ONE CHUNK ===
+
 def process_chunk(args):
     chunk, idx, result_list = args
     pat = re.compile(MOBILE_REGEX)
+
     doc = Document()
-    rows, seen, hits, parse_fail = [], 0, 0, 0
+    rows = []
+    seen = had_phone = hits = parse_fail = 0
     parse_errors = []
 
     for set_name, key, raw_json in chunk:
@@ -108,32 +109,43 @@ def process_chunk(args):
         values = [json.dumps(v) if isinstance(v, (dict, list)) else str(v)
                   for v in flat.values()]
 
+        this_record_hits = []
         for m in pat.finditer(raw_json):
             num = m.group(1)
-            if not any(num in v for v in values):
-                continue
-            hits += 1
-            para = doc.add_paragraph(f"{set_name} | {key} | ")
-            para.add_run(raw_json.replace("\n", " "))
-            run1 = para.add_run(f" | {num}")
-            run1.font.color.rgb = RGBColor(255, 0, 0)
-            field = ""
+            if any(num in v for v in values):
+                this_record_hits.append((num, m.span(1)))
+
+        if not this_record_hits:
+            continue
+
+        had_phone += 1
+        # build Word
+        para = doc.add_paragraph(f"{set_name} | {key} | ")
+        unesc = raw_json.replace('\n', ' ')
+        para.add_run(unesc)
+        for num, (s, e) in this_record_hits:
+            run = para.add_run(f" | {num}")
+            run.font.color.rgb = RGBColor(255, 0, 0)
+            # find field
+            fld = ""
             for path, v in flat.items():
                 txt = json.dumps(v) if isinstance(v, (dict, list)) else str(v)
                 if num in txt:
-                    field = path
+                    fld = path
                     break
-            run2 = para.add_run(f" | field: {field}")
+            run2 = para.add_run(f" | field: {fld}")
             run2.font.color.rgb = RGBColor(255, 0, 0)
-            rows.append((set_name, key, raw_json, num, field))
+            rows.append((set_name, key, raw_json, num, fld))
+
+        hits += len(this_record_hits)
 
     if rows:
         os.makedirs(TEMP_DIR, exist_ok=True)
         doc.save(os.path.join(TEMP_DIR, f"chunk_{idx}.docx"))
 
-    result_list.append((rows, seen, hits, parse_fail, parse_errors))
+    result_list.append((rows, seen, had_phone, hits, parse_fail, parse_errors))
 
-# === MERGE DOCX ===
+
 def merge_word():
     merged = Document()
     for fn in tqdm(sorted(os.listdir(TEMP_DIR)), desc="Merging Word"):
@@ -149,7 +161,7 @@ def merge_word():
                 nr.bold, nr.italic, nr.underline = r.bold, r.italic, r.underline
     merged.save(OUTPUT_DOCX)
 
-# === WRITE EXCEL WITH PARSE ERRORS SHEET ===
+
 def write_excel(rows, parse_errors):
     wb = xlsxwriter.Workbook(OUTPUT_XLSX)
     # Matches sheet
@@ -164,7 +176,6 @@ def write_excel(rows, parse_errors):
         ws.write(r, 3, m, red)
         ws.write(r, 4, f)
         r += 1
-
     # Parse Failures sheet
     pf_ws = wb.add_worksheet("Parse Failures")
     pf_ws.write_row(0, 0, ["Set Name", "Key", "Raw JSON"])
@@ -174,16 +185,16 @@ def write_excel(rows, parse_errors):
         pf_ws.write(r, 1, b)
         pf_ws.write(r, 2, raw)
         r += 1
-
     wb.close()
 
+
 if __name__ == "__main__":
-    # 1) Load
+    # Load
     print("Loading Aerospike records …")
     records, warn_count, skipped = load_records()
     print(f"→ Total records loaded: {len(records)}  (warnings: {warn_count})")
 
-    # 2) Process chunks
+    # Process
     mgr = Manager()
     results = mgr.list()
     chunks = list(chunk_records(records))
@@ -197,27 +208,28 @@ if __name__ == "__main__":
             desc="Processing records",
         ))
 
-    # 3) Aggregate
+    # Aggregate
     all_rows = []
-    total_seen = total_hits = total_parse_fail = 0
+    total_seen = total_had_phone = total_hits = total_pf = 0
     parse_errors = []
-    for rows, seen, hits, pfail, pfd in results:
+    for rows, seen, had_phone, hits, pfail, pfails in results:
         all_rows.extend(rows)
         total_seen += seen
+        total_had_phone += had_phone
         total_hits += hits
-        total_parse_fail += pfail
-        parse_errors.extend(pfd)
+        total_pf += pfail
+        parse_errors.extend(pfails)
 
-    # 4) Summary and exit code
+    # Summary
     print(
         f"\nScanned {total_seen} records, "
+        f"{total_had_phone} had phones, "
         f"{total_hits} total hits, "
-        f"{total_parse_fail} JSON parse failures"
+        f"{total_pf} JSON parse failures"
     )
-    exit_code = 0 if total_hits > 0 and total_parse_fail == 0 else 1
 
-    # 5) Output
-    if os.path.isdir(TEMP_DIR) and total_hits > 0:
+    # Output
+    if os.path.isdir(TEMP_DIR) and total_had_phone > 0:
         merge_word()
     write_excel(all_rows, parse_errors)
     if os.path.isdir(TEMP_DIR):
@@ -225,4 +237,4 @@ if __name__ == "__main__":
 
     print(f"\n→ Word saved: {OUTPUT_DOCX}")
     print(f"→ Excel saved: {OUTPUT_XLSX}\n")
-    sys.exit(exit_code)
+    sys.exit(0 if total_hits and total_pf == 0 else 1)
