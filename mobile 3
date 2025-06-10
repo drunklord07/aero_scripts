@@ -14,6 +14,7 @@ CHUNK_SIZE   = 2000
 OUTPUT_DOCX  = "aerospike_mobiles.docx"
 OUTPUT_XLSX  = "aerospike_mobiles.xlsx"
 TEMP_DIR     = "temp_aero_parts"
+
 MOBILE_REGEX = r'(?<!\d)((?:\+91[\-\s]?|91[\-\s]?|0)?[6-9]\d{9})(?!\d)'
 
 # === FLATTEN JSON ===
@@ -38,140 +39,155 @@ def flatten_json(obj, prefix=""):
             flat.update(flatten_json(item, f"{prefix}[{i}]."))
     return flat
 
-# === LOAD & GROUP RECORDS ===
+# === LOAD RECORDS ===
 def load_records():
     """
-    Single-pass header + brace-scanning loader.
+    Read INPUT_FILE, detect every 'Set Name:' header, and
+    always produce one record per header. If JSON Data: is missing
+    or braces never close, raw_json is set to "" (no parse attempt).
     Returns:
-      records: list of (set_name, key, raw_json)
-      load_warnings: int
-      skipped_headers: list of header texts that failed to parse
+      records: [(set_name, key, raw_json), ...]
+      warnings: count of malformed headers
+      skipped: list of (lineno, header_line) for headers malformed or missing Set Name
     """
-    text = open(INPUT_FILE, encoding="utf-8", errors="ignore").read()
-    # Regex to capture up to JSON Data:
-    header_pat = re.compile(
-        r"Set\s+Name\s*:\s*(?P<set>[^,]+)"
-        r"(?:\s*,\s*Key\s*:\s*(?P<key>[^,]+))?"
-        r".*?JSON\s*Data\s*:",
+    header_re = re.compile(
+        r"Set\s+Name\s*:\s*([^,]+)"
+        r"(?:\s*,\s*Key\s*:\s*([^,]+))?",
         flags=re.IGNORECASE
     )
 
     records = []
-    skipped = []
     warnings = 0
-    pos = 0
-    while True:
-        m = header_pat.search(text, pos)
-        if not m:
-            break
-        hdr_start = m.start()
-        json_marker_end = m.end()
-        set_name = m.group("set").strip()
-        key      = (m.group("key") or "").strip()
-        # find first '{' after JSON Data:
-        brace_i = text.find("{", json_marker_end)
-        if brace_i < 0:
-            warnings += 1
-            skipped.append(text[hdr_start:json_marker_end])
-            pos = json_marker_end
-            continue
-        # scan for matching closing '}'
-        count = 1
-        i = brace_i + 1
-        L = len(text)
-        while i < L and count > 0:
-            if text[i] == "{":
-                count += 1
-            elif text[i] == "}":
-                count -= 1
+    skipped = []
+
+    lines = open(INPUT_FILE, encoding="utf-8", errors="ignore").read().splitlines()
+    n = len(lines)
+    i = 0
+
+    while i < n:
+        line = lines[i].rstrip()
+        if not line.strip():
             i += 1
-        if count != 0:
-            warnings += 1
-            skipped.append(text[hdr_start:json_marker_end])
-            pos = json_marker_end
             continue
-        raw_json = text[brace_i:i]
-        records.append((set_name, key, raw_json))
-        pos = i
+        if line.lower().startswith("set name:"):
+            m = header_re.match(line)
+            if not m:
+                warnings += 1
+                skipped.append((i+1, line))
+                i += 1
+                continue
+
+            set_name = m.group(1).strip()
+            key = (m.group(2) or "").strip()
+            raw_json = ""
+
+            # find JSON Data: within this header or subsequent lines
+            j = line.find("JSON Data:")
+            if j >= 0:
+                # header contains JSON Data
+                json_part = line[j+len("JSON Data:"):]
+                brace_count = json_part.count("{") - json_part.count("}")
+                buffer = [json_part]
+                i += 1
+                # buffer until braces balance or EOF
+                while i < n and brace_count > 0:
+                    l2 = lines[i]
+                    buffer.append(l2)
+                    brace_count += l2.count("{") - l2.count("}")
+                    i += 1
+                if brace_count == 0:
+                    raw_json = "\n".join(buffer)
+                else:
+                    warnings += 1
+                    skipped.append((i, f"unclosed JSON for {set_name}"))
+            else:
+                # no JSON Data marker: warn but still record empty raw_json
+                warnings += 1
+                skipped.append((i+1, f"No JSON Data: in header for {set_name}"))
+                i += 1
+
+            records.append((set_name, key, raw_json))
+        else:
+            i += 1
 
     return records, warnings, skipped
 
-# === SPLIT INTO CHUNKS ===
+# === CHUNK RECORDS ===
 def chunk_records(records):
-    for i in range(0, len(records), CHUNK_SIZE):
-        yield records[i:i+CHUNK_SIZE], i//CHUNK_SIZE
+    for idx in range(0, len(records), CHUNK_SIZE):
+        yield records[idx:idx+CHUNK_SIZE], idx//CHUNK_SIZE
 
-# === PROCESS ONE CHUNK ===
+# === PROCESS CHUNK ===
 def process_chunk(args):
     chunk, idx, result_list = args
     pat = re.compile(MOBILE_REGEX)
 
     doc = Document()
     rows = []
-    seen = with_phone = parse_fail = 0
+    seen = with_mob = parse_fail = 0
     parse_fail_details = []
 
-    for set_name, key, raw_json in chunk:
+    for set_name, key, raw in chunk:
         seen += 1
+        if not raw:
+            continue
         try:
-            obj = json.loads(raw_json)
+            obj = json.loads(raw)
             flat = flatten_json(obj)
-        except json.JSONDecodeError:
+        except:
             parse_fail += 1
-            snip = raw_json[:100].replace("\n"," ") + "…"
-            parse_fail_details.append((set_name, key, snip))
+            snippet = raw[:100].replace("\n"," ") + "…"
+            parse_fail_details.append((set_name, key, snippet))
             continue
 
-        values = [json.dumps(v) if isinstance(v,(dict,list)) else str(v)
-                  for v in flat.values()]
+        vals = [json.dumps(v) if isinstance(v,(dict,list)) else str(v)
+                for v in flat.values()]
         hits = [(m.group(1), m.span(1))
-                for m in pat.finditer(raw_json)
-                if any(m.group(1) in v for v in values)]
+                for m in pat.finditer(raw)
+                if any(m.group(1) in v for v in vals)]
         if not hits:
             continue
 
-        with_phone += 1
+        with_mob += 1
         para = doc.add_paragraph(f"{set_name} | {key} | ")
         last = 0
         fields = []
-        for phone, (s,e) in sorted(hits, key=lambda x:x[1][0]):
-            if s>last:
-                para.add_run(raw_json[last:s])
-            run = para.add_run(phone); run.font.color.rgb = RGBColor(255,0,0)
+        for mob, (s,e) in sorted(hits, key=lambda x:x[1][0]):
+            if s>last: para.add_run(raw[last:s])
+            run = para.add_run(mob); run.font.color.rgb = RGBColor(255,0,0)
             last = e
-            fld = ""
-            for path, v in flat.items():
+            fld=""
+            for path,v in flat.items():
                 txt = json.dumps(v) if isinstance(v,(dict,list)) else str(v)
-                if phone in txt:
-                    fld = path; break
+                if mob in txt:
+                    fld=path; break
             fields.append(fld)
-        if last < len(raw_json):
-            para.add_run(raw_json[last:])
+        if last < len(raw): para.add_run(raw[last:])
         para.add_run(" | field: ")
         for i,fld in enumerate(fields):
             if i: para.add_run(", ")
-            fr = para.add_run(fld); fr.font.color.rgb = RGBColor(255,0,0)
-        for phone,_ in hits:
-            rows.append((set_name, key, raw_json, phone, fields.pop(0)))
+            fr = para.add_run(fld); fr.font.color.rgb=RGBColor(255,0,0)
+        for mob,_ in hits:
+            rows.append((set_name, key, raw, mob, fields.pop(0)))
 
     if rows:
         os.makedirs(TEMP_DIR, exist_ok=True)
         doc.save(os.path.join(TEMP_DIR, f"chunk_{idx}.docx"))
 
-    result_list.append((rows, seen, with_phone, parse_fail, parse_fail_details))
+    result_list.append((rows, seen, with_mob, parse_fail, parse_fail_details))
 
-# === MERGE DOCX ===
+# === MERGE .docx ===
 def merge_word():
     merged = Document()
     for fn in tqdm(sorted(os.listdir(TEMP_DIR)), desc="Merging Word"):
         if not fn.endswith(".docx"): continue
-        for para in Document(os.path.join(TEMP_DIR,fn)).paragraphs:
-            out = merged.add_paragraph()
-            for run in para.runs:
-                nr = out.add_run(run.text)
-                if run.font.color and run.font.color.rgb:
-                    nr.font.color.rgb = run.font.color.rgb
-                nr.bold, nr.italic, nr.underline = run.bold, run.italic, run.underline
+        for p in Document(os.path.join(TEMP_DIR,fn)).paragraphs:
+            np = merged.add_paragraph()
+            for r in p.runs:
+                nr=np.add_run(r.text)
+                if r.font.color and r.font.color.rgb:
+                    nr.font.color.rgb=r.font.color.rgb
+                nr.bold,nr.italic,nr.underline = r.bold,r.italic,r.underline
     merged.save(OUTPUT_DOCX)
 
 # === WRITE EXCEL ===
@@ -181,9 +197,9 @@ def write_excel(rows):
     red = wb.add_format({"font_color":"red"})
     ws.write_row(0,0,["Set Name","Key","Full JSON","Mobile","Field"])
     r=1
-    for a,b,c,ph,f in rows:
+    for a,b,c,m,f in rows:
         ws.write(r,0,a); ws.write(r,1,b); ws.write(r,2,c)
-        ws.write(r,3,ph,red); ws.write(r,4,f)
+        ws.write(r,3,m,red); ws.write(r,4,f)
         r+=1
     wb.close()
 
@@ -194,22 +210,21 @@ if __name__=="__main__":
     print(f"Loaded {len(recs)} records, warnings: {warns}")
     if skipped:
         print("Skipped headers:")
-        for s in skipped:
-            print(" ",s.strip())
+        for ln,hd in skipped: print(" ",ln,hd)
     mgr=Manager(); results=mgr.list()
-    chunks=list(chunk_records(recs))
-    with Pool(min(len(chunks),cpu_count())) as p:
+    ch=list(chunk_records(recs))
+    with Pool(min(len(ch),cpu_count())) as p:
         list(tqdm(p.imap_unordered(process_chunk,
-             [(ch,i,results) for ch,i in chunks]),
-             total=len(chunks),desc="Processing"))
-    all_rows=[]; tot=wp=pf=0; pfails=[]
-    for rows,seen,wpn,pf,pfd in results:
-        all_rows+=rows; tot+=seen; wp+=wpn; pf+=pf; pfails+=pfd
-    print(f"Scanned {tot}, {wp} had phones, {len(all_rows)} hits, {pf} JSON errors")
+             [(c,i,results) for c,i in ch]),
+             total=len(ch),desc="Processing"))
+    all_rows=[];tot=wm=pf=0;pfails=[]
+    for rows,seen,wmc,pf,pfd in results:
+        all_rows+=rows; tot+=seen; wm+=wmc; pf+=pf; pfails+=pfd
+    print(f"Scanned {tot}, {wm} with mobiles, {len(all_rows)} hits, {pf} JSON errors")
     if pfails:
         print("JSON errors:")
         for s,k,sp in pfails: print(" ",s,k,sp)
     if os.path.isdir(TEMP_DIR) and tot>0: merge_word()
     write_excel(all_rows)
     shutil.rmtree(TEMP_DIR,ignore_errors=True)
-    print("Done →",OUTPUT_DOCX,OUTPUT_XLSX)```
+    print("Done →", OUTPUT_DOCX, OUTPUT_XLSX)```
