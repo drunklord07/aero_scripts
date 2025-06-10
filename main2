@@ -1,88 +1,134 @@
 #!/usr/bin/env python3
 import os
-import sys
-import shutil
+import glob
+import re
 import subprocess
-import concurrent.futures
+import argparse
+import shutil
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
-
-# For Excel consolidation
 import pandas as pd
 
-# === CONFIG ===
-MAX_PARALLEL = 3
-OUTPUT_DIR   = "outputs"
-MASTER_XLSX  = "master.xlsx"
-
 def find_scripts():
-    me = os.path.basename(__file__)
-    return [f for f in os.listdir(".")
-            if f.endswith(".py") and f != me]
+    """Recursively find all .py files except this driver."""
+    me = os.path.abspath(__file__)
+    scripts = [
+        fn for fn in glob.glob("**/*.py", recursive=True)
+        if os.path.abspath(fn) != me
+    ]
+    return sorted(scripts)
 
-def run_script(script):
-    """Run a script as a subprocess, return (script, success)."""
-    try:
-        res = subprocess.run(
-            [sys.executable, script],
-            capture_output=True,
-            text=True
-        )
-        success = (res.returncode == 0)
-        return script, success, res.returncode, res.stdout + res.stderr
-    except Exception as e:
-        return script, False, -1, str(e)
+def parse_expected_outputs(script_path):
+    """
+    Peek at the script source to find OUTPUT_XLSX and OUTPUT_DOCX.
+    Falls back to <basename>.xlsx/.docx.
+    """
+    base = os.path.splitext(os.path.basename(script_path))[0]
+    text = open(script_path, encoding="utf-8", errors="ignore").read()
+    m_x = re.search(r'OUTPUT_XLSX\s*=\s*["\'](.+?\.xlsx)["\']', text)
+    m_d = re.search(r'OUTPUT_DOCX\s*=\s*["\'](.+?\.docx)["\']', text)
+    xlsx = m_x.group(1) if m_x else f"{base}.xlsx"
+    docx = m_d.group(1) if m_d else f"{base}.docx"
+    return xlsx, docx
+
+def run_script(path):
+    """
+    Run `python path` from cwd. Capture output, return dictionary with:
+      - path, basename, returncode, log
+      - expected_xlsx/docx
+      - missing outputs
+    """
+    base = os.path.splitext(os.path.basename(path))[0]
+    exp_xlsx, exp_docx = parse_expected_outputs(path)
+
+    proc = subprocess.run(
+        [sys.executable, path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding='utf-8',
+        errors='replace'
+    )
+
+    missing = []
+    for fn in (exp_xlsx, exp_docx):
+        if not os.path.isfile(fn):
+            missing.append(fn)
+
+    return {
+        "path": path,
+        "basename": base,
+        "returncode": proc.returncode,
+        "expected_xlsx": exp_xlsx,
+        "expected_docx": exp_docx,
+        "missing": missing,
+        "log": proc.stdout,
+    }
 
 def main():
-    scripts = find_scripts()
-    if not scripts:
-        print("No scripts found to run.")
-        sys.exit(1)
+    p = argparse.ArgumentParser(description="Master runner for Aerospike extractors")
+    p.add_argument("-c", "--combined", default="combined_output.xlsx",
+                   help="Master Excel filename")
+    p.add_argument("-j", "--max-parallel", type=int, default=3,
+                   help="Max concurrent scripts")
+    args = p.parse_args()
 
-    # Prepare outputs folder
-    if os.path.isdir(OUTPUT_DIR):
-        shutil.rmtree(OUTPUT_DIR)
-    os.makedirs(OUTPUT_DIR)
+    scripts = find_scripts()
+    print(f"Found {len(scripts)} scripts to run.\n")
+
+    # Ensure outputs directory exists
+    out_dir = "outputs"
+    if os.path.isdir(out_dir):
+        shutil.rmtree(out_dir)
+    os.makedirs(out_dir)
 
     results = []
-    # Run scripts in parallel, up to MAX_PARALLEL at once
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_PARALLEL) as executor:
-        future_to_script = {
-            executor.submit(run_script, script): script
-            for script in scripts
-        }
-        for future in tqdm(concurrent.futures.as_completed(future_to_script),
-                           total=len(future_to_script),
-                           desc="Running scripts"):
-            script, success, code, log = future.result()
-            results.append((script, success))
-            if success:
-                base = os.path.splitext(script)[0]
-                for ext in (".docx", ".xlsx"):
-                    src = base + ext
-                    if os.path.exists(src):
-                        shutil.copy(src, os.path.join(OUTPUT_DIR, src))
+    with ThreadPoolExecutor(max_workers=args.max_parallel) as exe:
+        futures = {exe.submit(run_script, s): s for s in scripts}
+        for fut in tqdm(as_completed(futures),
+                        total=len(futures),
+                        desc="Running scripts",
+                        ascii=True):
+            res = fut.result()
+            results.append(res)
+            name = res["basename"]
+            if res["returncode"] != 0:
+                print(f"[ERROR] {name} exited {res['returncode']}")
+                print(res["log"])
+            elif res["missing"]:
+                print(f"[WARN] {name} missing: {res['missing']}")
+            else:
+                # copy outputs
+                for fn in (res["expected_docx"], res["expected_xlsx"]):
+                    if os.path.exists(fn):
+                        shutil.copy(fn, os.path.join(out_dir, fn))
 
-    # Summarize
     total = len(results)
-    succeeded = sum(1 for _, ok in results if ok)
-    failed = total - succeeded
-    print(f"\n→ {succeeded}/{total} scripts succeeded, {failed} failed")
+    ok = sum(1 for r in results if r["returncode"] == 0 and not r["missing"])
+    print(f"\nScripts run: {total}, succeeded: {ok}, failed/skipped: {total-ok}\n")
 
-    # Consolidate Excels
-    excel_files = sorted(f for f in os.listdir(OUTPUT_DIR) if f.endswith(".xlsx"))
-    if excel_files:
-        with pd.ExcelWriter(MASTER_XLSX, engine="xlsxwriter") as writer:
-            for fname in excel_files:
-                sheet = os.path.splitext(fname)[0]
-                df = pd.read_excel(os.path.join(OUTPUT_DIR, fname))
-                df.to_excel(writer, sheet_name=sheet, index=False)
-        print(f"→ Master Excel written to {MASTER_XLSX}")
-    else:
-        print("→ No Excel files found to consolidate.")
+    # Merge Excel
+    excels = [
+        os.path.join(out_dir, r["expected_xlsx"])
+        for r in results
+        if r["returncode"] == 0 and not r["missing"]
+        and os.path.isfile(os.path.join(out_dir, r["expected_xlsx"]))
+    ]
+    if not excels:
+        print("No Excel files to merge.")
+        sys.exit(1)
 
-    # Done
-    print(f"→ Outputs collected in ./{OUTPUT_DIR}/")
-    sys.exit(0 if failed == 0 else 1)
+    print(f"Merging {len(excels)} Excel files into '{args.combined}'")
+    with pd.ExcelWriter(args.combined, engine="xlsxwriter") as writer:
+        for f in tqdm(excels, desc="Merging sheets", ascii=True):
+            df = pd.read_excel(f)
+            sheet = os.path.splitext(os.path.basename(f))[0][:31]
+            df.to_excel(writer, sheet_name=sheet, index=False)
+
+    print(f"\nMaster workbook created: {args.combined}")
+    print(f"Outputs directory: {out_dir}")
+    sys.exit(0 if ok == total else 1)
 
 if __name__ == "__main__":
     main()
