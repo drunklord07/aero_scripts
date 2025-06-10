@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+import os
+import sys
+import shutil
+import subprocess
+import concurrent.futures
+from tqdm import tqdm
+
+# For Excel consolidation
+import pandas as pd
+
+# === CONFIG ===
+MAX_PARALLEL = 3
+OUTPUT_DIR   = "outputs"
+MASTER_XLSX  = "master.xlsx"
+
+def find_scripts():
+    me = os.path.basename(__file__)
+    return [f for f in os.listdir(".")
+            if f.endswith(".py") and f != me]
+
+def run_script(script):
+    """Run a script as a subprocess, return (script, success)."""
+    try:
+        res = subprocess.run(
+            [sys.executable, script],
+            capture_output=True,
+            text=True
+        )
+        success = (res.returncode == 0)
+        return script, success, res.returncode, res.stdout + res.stderr
+    except Exception as e:
+        return script, False, -1, str(e)
+
+def main():
+    scripts = find_scripts()
+    if not scripts:
+        print("No scripts found to run.")
+        sys.exit(1)
+
+    # Prepare outputs folder
+    if os.path.isdir(OUTPUT_DIR):
+        shutil.rmtree(OUTPUT_DIR)
+    os.makedirs(OUTPUT_DIR)
+
+    results = []
+    # Run scripts in parallel, up to MAX_PARALLEL at once
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_PARALLEL) as executor:
+        future_to_script = {
+            executor.submit(run_script, script): script
+            for script in scripts
+        }
+        for future in tqdm(concurrent.futures.as_completed(future_to_script),
+                           total=len(future_to_script),
+                           desc="Running scripts"):
+            script, success, code, log = future.result()
+            results.append((script, success))
+            if success:
+                base = os.path.splitext(script)[0]
+                for ext in (".docx", ".xlsx"):
+                    src = base + ext
+                    if os.path.exists(src):
+                        shutil.copy(src, os.path.join(OUTPUT_DIR, src))
+
+    # Summarize
+    total = len(results)
+    succeeded = sum(1 for _, ok in results if ok)
+    failed = total - succeeded
+    print(f"\n→ {succeeded}/{total} scripts succeeded, {failed} failed")
+
+    # Consolidate Excels
+    excel_files = sorted(f for f in os.listdir(OUTPUT_DIR) if f.endswith(".xlsx"))
+    if excel_files:
+        with pd.ExcelWriter(MASTER_XLSX, engine="xlsxwriter") as writer:
+            for fname in excel_files:
+                sheet = os.path.splitext(fname)[0]
+                df = pd.read_excel(os.path.join(OUTPUT_DIR, fname))
+                df.to_excel(writer, sheet_name=sheet, index=False)
+        print(f"→ Master Excel written to {MASTER_XLSX}")
+    else:
+        print("→ No Excel files found to consolidate.")
+
+    # Done
+    print(f"→ Outputs collected in ./{OUTPUT_DIR}/")
+    sys.exit(0 if failed == 0 else 1)
+
+if __name__ == "__main__":
+    main()
