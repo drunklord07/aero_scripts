@@ -2,6 +2,7 @@ import os
 import re
 import json
 import shutil
+import sys
 from multiprocessing import Pool, Manager, cpu_count
 from docx import Document
 from docx.shared import RGBColor
@@ -9,13 +10,12 @@ import xlsxwriter
 from tqdm import tqdm
 
 # === CONFIG ===
-INPUT_FILE    = "input.txt"                    # your Aerospike log file
-CHUNK_SIZE    = 2000                           # records per worker
+INPUT_FILE    = "input.txt"
+CHUNK_SIZE    = 2000
 OUTPUT_DOCX   = "aerospike_account.docx"
 OUTPUT_XLSX   = "aerospike_account.xlsx"
 TEMP_DIR      = "temp_aero_account_parts"
-
-account_keys = [
+KEYWORDS      = [
     "account number", "acc number", "account no", "account_no", "acc_no",
     "bank account", "bank account number", "acct number", "a/c number", "a/c no",
     "accountnum", "accountnumbr", "account", "account id",
@@ -24,195 +24,115 @@ account_keys = [
     "receiving account", "sender account", "payee account", "receiver account",
     "to account", "from account"
 ]
-
-# Precompile a regex for fallback extraction:
-#   Matches any keyword from account_keys followed by ':' or '=' then captures the value up to a comma or closing brace/newline
 KEYWORD_PATTERN = re.compile(
-    r"(?P<key>" + "|".join(re.escape(k) for k in account_keys) + r")\s*[:=]\s*(?P<val>[^,}\n\r]+)",
+    r"(?P<key>" + "|".join(re.escape(k) for k in KEYWORDS) + r")\s*[:=]\s*(?P<val>[^,}\n\r]+)",
     flags=re.IGNORECASE
 )
 
-# === CLEANER FOR XML-COMPATIBLE STRINGS ===
-def clean_xml_string(s: str) -> str:
-    return "".join(
-        ch
-        for ch in s
-        if ch in "\n\r\t"
-        or (0x20 <= ord(ch) <= 0xD7FF)
-        or (0xE000 <= ord(ch) <= 0xFFFD)
-    )
-
-# === FIND KEYS IN A PYTHON OBJECT (CASE-INSENSITIVE SUBSTRING MATCH) ===
-def find_keys(obj, keywords, path=None):
-    """
-    Recursively walk a Python dict/list. Whenever a dict key's lowercase
-    contains any keyword, capture (path+[key], value).
-    """
-    if path is None:
-        path = []
-    matches = []
+# === FLATTEN JSON ===
+def flatten_json(obj, prefix=""):
+    flat = {}
     if isinstance(obj, dict):
         for k, v in obj.items():
-            lowkey = k.strip().lower()
-            if any(kw in lowkey for kw in keywords):
-                matches.append((path + [k], v))
-            matches.extend(find_keys(v, keywords, path + [k]))
-    elif isinstance(obj, list):
-        for idx, item in enumerate(obj):
-            matches.extend(find_keys(item, keywords, path + [str(idx)]))
-    return matches
-
-# === INLINE HIGHLIGHT HELPER ===
-def add_highlighted_payload(para, payload, found_intervals):
-    """
-    Given 'found_intervals' = list of (start, end) byte-indexes to highlight in red,
-    write the payload into 'para' by splitting it into runs.
-    """
-    # Merge overlapping intervals
-    merged = []
-    for s, e in sorted(found_intervals):
-        if not merged:
-            merged.append([s, e])
-        else:
-            last = merged[-1]
-            if s <= last[1]:
-                last[1] = max(last[1], e)
+            path = f"{prefix}{k}"
+            if isinstance(v, (dict, list)):
+                flat.update(flatten_json(v, path + "."))
             else:
-                merged.append([s, e])
-
-    pos = 0
-    for start, end in merged:
-        if start > pos:
-            para.add_run(clean_xml_string(payload[pos:start]))
-        run = para.add_run(clean_xml_string(payload[start:end]))
-        run.font.color.rgb = RGBColor(255, 0, 0)
-        pos = end
-    if pos < len(payload):
-        para.add_run(clean_xml_string(payload[pos:]))
+                flat[path] = v
+    elif isinstance(obj, list):
+        for i, item in enumerate(obj):
+            flat.update(flatten_json(item, f"{prefix}[{i}]."))
+    return flat
 
 # === LOAD & GROUP RECORDS ===
 def load_records():
     """
-    Read INPUT_FILE line by line. Whenever a line starts with "Set Name:",
-    begin buffering until braces { } balance. Extract:
-      • set_name (string)
-      • key (string)
-      • raw_json (string including braces)
-    Malformed headers or unbalanced braces increment load_warnings.
+    Single-pass header + brace-scanning loader.
     Returns:
-      records = [ (set_name, key, raw_json), … ]
-      load_warnings = number of skipped/malformed records
+      records: list of (set_name, key, raw_json)
+      warnings: count of malformed/unbalanced blocks
+      skipped: list of (set_name, key, reason)
     """
-    records = []
-    load_warnings = 0
+    text = open(INPUT_FILE, encoding="utf-8", errors="ignore").read()
+    header_pat = re.compile(
+        r"Set\s+Name\s*:\s*(?P<set>[^,]+)"
+        r"(?:\s*,\s*Key\s*:\s*(?P<key>[^,]+))?"
+        r".*?JSON\s*Data\s*:",
+        flags=re.IGNORECASE
+    )
 
-    buffer = []
-    in_record = False
-    brace_count = 0
-    header_re = re.compile(r"^Set\s+Name:\s*([^,]+),\s*Key:\s*(.+)", re.IGNORECASE)
-
-    with open(INPUT_FILE, "r", encoding="utf-8", errors="ignore") as f:
-        for raw_line in f:
-            line = raw_line.rstrip("\r\n")
-            if line.startswith("Set Name:"):
-                if in_record and brace_count != 0:
-                    load_warnings += 1
-                buffer = [line]
-                brace_count = line.count("{") - line.count("}")
-                in_record = True
-
-            elif in_record:
-                buffer.append(line)
-                brace_count += line.count("{") - line.count("}")
-
-                if brace_count == 0:
-                    if "JSON Data:" not in buffer[0]:
-                        load_warnings += 1
-                        in_record = False
-                        continue
-
-                    header_part, json_start = buffer[0].split("JSON Data:", 1)
-                    m = header_re.match(header_part)
-                    if not m:
-                        load_warnings += 1
-                        in_record = False
-                        continue
-
-                    set_name = m.group(1).strip()
-                    key = m.group(2).strip().rstrip(",")
-                    json_lines = [json_start] + buffer[1:]
-                    raw_json = "\n".join(json_lines)
-
-                    records.append((set_name, key, raw_json))
-                    in_record = False
-
-            else:
-                load_warnings += 1
-
-        if in_record and brace_count != 0:
-            load_warnings += 1
-
-    return records, load_warnings
+    records, skipped, warnings = [], [], 0
+    pos, L = 0, len(text)
+    while True:
+        m = header_pat.search(text, pos)
+        if not m:
+            break
+        set_name = m.group("set").strip()
+        key      = (m.group("key") or "").strip()
+        brace_i  = text.find("{", m.end())
+        if brace_i < 0:
+            warnings += 1
+            skipped.append((set_name, key, "no JSON opening brace"))
+            pos = m.end()
+            continue
+        count, i = 1, brace_i + 1
+        while i < L and count:
+            if text[i] == "{":
+                count += 1
+            elif text[i] == "}":
+                count -= 1
+            i += 1
+        if count != 0:
+            warnings += 1
+            skipped.append((set_name, key, "unbalanced JSON braces"))
+            pos = m.end()
+            continue
+        raw_json = text[brace_i:i]
+        records.append((set_name, key, raw_json))
+        pos = i
+    return records, warnings, skipped
 
 # === SPLIT INTO CHUNKS ===
 def chunk_records(records):
-    """
-    Yield (records_chunk, chunk_index) in slices of CHUNK_SIZE.
-    """
-    for i in range(0, len(records), CHUNK_SIZE):
-        yield records[i : i + CHUNK_SIZE], (i // CHUNK_SIZE)
+    for idx in range(0, len(records), CHUNK_SIZE):
+        yield records[idx:idx+CHUNK_SIZE], idx//CHUNK_SIZE
 
-# === WORKER FUNCTION ===
+# === PROCESS ONE CHUNK (ACCOUNT EXTRACTION) ===
 def process_chunk(args):
-    """
-    Each chunk: list of (set_name, key, raw_json).
-    For each record:
-      1. Attempt json.loads(raw_json). If OK, recursively search dict/list
-         keys for any substring matching account_keys. Collect (field_path, value).
-      2. Regex fallback: scan raw_json for KEYWORD_PATTERN. Collect (key, val).
-      3. Combine JSON matches + fallback without duplicates.
-      4. If combined nonempty:
-         - In Word paragraph: "SetName | Key | " then inline-highlight raw_json at
-           each matched value and matched key substring, then append "| value: val1, … | field: path1, …"
-         - In Excel: one row per (field_path or fallback key, matched value).
-      5. Save partial .docx if any matches. Append (matches_data, seen, with_account).
-    """
     chunk, idx, result_list = args
-    lc_keys = {kw.lower() for kw in account_keys}
-
     doc = Document()
-    matches_data = []
-    seen = 0
-    with_account = 0
+    rows = []
+    seen = with_acc = hits = parse_fail = 0
+    parse_errors = []
 
     for set_name, key, raw_json in chunk:
         seen += 1
-        json_matches = []
-        fallback_matches = []
-
-        # 1) JSON parsing + recursive search
         try:
             obj = json.loads(raw_json)
+            flat = flatten_json(obj)
         except json.JSONDecodeError:
-            obj = None
+            parse_fail += 1
+            parse_errors.append((set_name, key, raw_json))
+            continue
 
-        if obj is not None:
-            found = find_keys(obj, lc_keys)
-            for path, val in found:
-                field_name = ".".join(path)
-                json_matches.append((field_name, str(val)))
+        # JSON key matches
+        json_matches = [
+            (".".join(path.split(".")), str(v))
+            for path, v in flat.items()
+            if any(kw in path.lower() for kw in KEYWORDS)
+        ]
 
-        # 2) Regex fallback on raw_json
-        for m in KEYWORD_PATTERN.finditer(raw_json):
-            key_text = m.group("key").strip()
-            val_text = m.group("val").strip()
-            fallback_matches.append((key_text, val_text))
+        # regex fallback matches
+        fallback = [
+            (m.group("key"), m.group("val"))
+            for m in KEYWORD_PATTERN.finditer(raw_json)
+        ]
 
-        # 3) Combine, removing duplicates
+        # combine unique
         combined = []
         seen_pairs = set()
-        for field_name, val_text in json_matches + fallback_matches:
-            pair = (field_name, val_text)
+        for fn, val in json_matches + fallback:
+            pair = (fn, val)
             if pair not in seen_pairs:
                 seen_pairs.add(pair)
                 combined.append(pair)
@@ -220,122 +140,117 @@ def process_chunk(args):
         if not combined:
             continue
 
-        with_account += 1
+        with_acc += 1
+        para = doc.add_paragraph(f"{set_name} | {key} | ")
+        para.add_run(raw_json.replace("\n", " "))
 
-        # 4) Build Word paragraph
-        para = doc.add_paragraph()
-        header = f"{set_name} | {key} | "
-        para.add_run(clean_xml_string(header))
-
-        # Determine highlight intervals
-        highlight_intervals = []
-        lower_json = raw_json.lower()
         for field_name, val_text in combined:
-            start_v = raw_json.find(val_text)
-            if start_v != -1:
-                highlight_intervals.append((start_v, start_v + len(val_text)))
-            key_low = field_name.split(".")[-1].lower()
-            pos_k = lower_json.find(key_low)
-            if pos_k != -1:
-                highlight_intervals.append((pos_k, pos_k + len(key_low)))
+            hits += 1
+            run1 = para.add_run(f" | {val_text}")
+            run1.font.color.rgb = RGBColor(255, 0, 0)
+            run2 = para.add_run(f" | field: {field_name}")
+            run2.font.color.rgb = RGBColor(255, 0, 0)
+            rows.append((set_name, key, raw_json, val_text, field_name))
 
-        add_highlighted_payload(para, raw_json, highlight_intervals)
-
-        # Append values
-        para.add_run(" | value: ")
-        for i, (_, val_text) in enumerate(combined):
-            if i:
-                para.add_run(", ")
-            run_val = para.add_run(clean_xml_string(val_text))
-            run_val.font.color.rgb = RGBColor(255, 0, 0)
-
-        # Append fields
-        para.add_run(" | field: ")
-        for i, (field_name, _) in enumerate(combined):
-            if i:
-                para.add_run(", ")
-            fr = para.add_run(field_name)
-            fr.font.color.rgb = RGBColor(255, 0, 0)
-
-        # Record for Excel
-        for field_name, val_text in combined:
-            matches_data.append((set_name, key, raw_json, val_text, field_name))
-
-    # Save partial .docx if matches exist
-    if matches_data:
+    if rows:
         os.makedirs(TEMP_DIR, exist_ok=True)
         doc.save(os.path.join(TEMP_DIR, f"chunk_{idx}.docx"))
 
-    result_list.append((matches_data, seen, with_account))
+    result_list.append((rows, seen, with_acc, hits, parse_fail, parse_errors))
 
-# === MERGE AND WRITE FUNCTIONS ===
+# === MERGE DOCX ===
 def merge_word():
     merged = Document()
     for fn in tqdm(sorted(os.listdir(TEMP_DIR)), desc="Merging Word"):
         if not fn.endswith(".docx"):
             continue
-        part = Document(os.path.join(TEMP_DIR, fn))
-        for p in part.paragraphs:
-            np = merged.add_paragraph()
-            for r in p.runs:
-                nr = np.add_run(r.text)
-                if r.font.color and r.font.color.rgb:
-                    nr.font.color.rgb = r.font.color.rgb
-                nr.bold, nr.italic, nr.underline = r.bold, r.italic, r.underline
+        sub = Document(os.path.join(TEMP_DIR, fn))
+        for para in sub.paragraphs:
+            out = merged.add_paragraph()
+            for run in para.runs:
+                nr = out.add_run(run.text)
+                if run.font.color and run.font.color.rgb:
+                    nr.font.color.rgb = run.font.color.rgb
+                nr.bold, nr.italic, nr.underline = run.bold, run.italic, run.underline
     merged.save(OUTPUT_DOCX)
 
-def write_excel(all_matches):
+# === WRITE EXCEL (Results + inline Parse Failures) ===
+def write_excel(rows, parse_errors):
     wb = xlsxwriter.Workbook(OUTPUT_XLSX)
-    ws = wb.add_worksheet()
-    red = wb.add_format({"font_color": "red"})
+    ws = wb.add_worksheet("Results")
+    red = wb.add_format({"font_color":"red"})
 
-    ws.write_row(0, 0, ["Set Name", "Key", "Full JSON", "Account", "Field"])
+    # Matches
+    ws.write_row(0, 0, ["Set Name","Key","Full JSON","Value","Field"])
     r = 1
-    for set_name, key, raw_json, val, field_name in all_matches:
-        ws.write(r, 0, set_name)
-        ws.write(r, 1, key)
-        ws.write(r, 2, raw_json)
-        ws.write(r, 3, val, red)
-        ws.write(r, 4, field_name)
+    for a, b, c, v, f in rows:
+        ws.write(r, 0, a)
+        ws.write(r, 1, b)
+        ws.write(r, 2, c)
+        ws.write(r, 3, v, red)
+        ws.write(r, 4, f)
         r += 1
+
+    # Two blank lines
+    r += 1
+
+    # Parse Failures
+    ws.write_row(r, 0, ["Parse Failures:"])
+    r += 1
+    ws.write_row(r, 0, ["Set Name","Key","Raw JSON"])
+    r += 1
+    for a, b, raw in parse_errors:
+        ws.write(r, 0, a)
+        ws.write(r, 1, b)
+        ws.write(r, 2, raw)
+        r += 1
+
     wb.close()
 
-# === MAIN ===
 if __name__ == "__main__":
-    if os.path.isdir(TEMP_DIR):
-        shutil.rmtree(TEMP_DIR)
+    # Load
+    print("Loading Aerospike records …")
+    records, warn_count, skipped = load_records()
+    print(f"→ Total records loaded: {len(records)}  (warnings: {warn_count})")
 
-    print("=== ACCOUNT EXTRACTOR (Aerospike) ===")
-    records, load_warnings = load_records()
-    print(f"Total records: {len(records)}  (warnings: {load_warnings})")
-    chunks = list(chunk_records(records))
-
+    # Process
     mgr = Manager()
     results = mgr.list()
+    chunks = list(chunk_records(records))
+    with Pool(min(len(chunks), cpu_count())) as pool:
+        list(tqdm(
+            pool.imap_unordered(process_chunk,
+                [(chunk, idx, results) for chunk, idx in chunks]),
+            total=len(chunks),
+            desc="Processing records",
+        ))
 
-    with Pool(min(cpu_count(), len(chunks))) as pool:
-        list(
-            tqdm(
-                pool.imap_unordered(
-                    process_chunk,
-                    [(chunk, idx, results) for chunk, idx in chunks],
-                ),
-                total=len(chunks),
-                desc="Processing chunks",
-            )
-        )
+    # Aggregate
+    all_rows = []
+    total_seen = total_with = total_hits = total_pf = 0
+    parse_errors = []
+    for rows, seen, with_acc, hits, pfail, pfd in results:
+        all_rows.extend(rows)
+        total_seen += seen
+        total_with += with_acc
+        total_hits += hits
+        total_pf += pfail
+        parse_errors.extend(pfd)
 
-    all_matches = []
-    total = matched = 0
-    for data, seen, with_account in results:
-        all_matches.extend(data)
-        total += seen
-        matched += with_account
+    # Summary
+    print(
+        f"\nScanned {total_seen} records, "
+        f"{total_with} had matches, "
+        f"{total_hits} total hits, "
+        f"{total_pf} JSON parse failures"
+    )
 
-    print(f"Records scanned: {total}, with Account matches: {matched}, total rows: {len(all_matches)}")
-
-    if os.path.isdir(TEMP_DIR):
+    # Output
+    if os.path.isdir(TEMP_DIR) and total_with > 0:
         merge_word()
-    write_excel(all_matches)
+    write_excel(all_rows, parse_errors)
+    shutil.rmtree(TEMP_DIR, ignore_errors=True)
 
-    print(f"\n→ Word saved to {OUTPUT_DOCX}\n→ Excel saved to {OUTPUT_XLSX}")
+    print(f"\n→ Word saved: {OUTPUT_DOCX}")
+    print(f"→ Excel saved: {OUTPUT_XLSX}\n")
+    sys.exit(0 if total_hits > 0 and total_pf == 0 else 1)
