@@ -21,38 +21,46 @@ ENV = os.environ.copy()
 ENV["PYTHONIOENCODING"] = "utf-8"
 
 # For grabbing summary & hits
-SUMMARY_RE = re.compile(r"records.*?hits", re.IGNORECASE)
-HITS_RE    = re.compile(r",\s*(\d+)\s+.*?hits", re.IGNORECASE)
-PARSE_FAIL_RE = re.compile(r"JSON parse failures?:", re.IGNORECASE)
+SUMMARY_RE     = re.compile(r"records.*?hits", re.IGNORECASE)
+HITS_RE        = re.compile(r",\s*(\d+)\s+.*?hits", re.IGNORECASE)
+PARSE_FAIL_RE  = re.compile(r"JSON parse failures?:", re.IGNORECASE)
 
 def find_scripts():
     me = os.path.abspath(__file__)
-    return sorted(fn for fn in glob.glob("**/*.py", recursive=True) if os.path.abspath(fn) != me)
+    return sorted(
+        fn for fn in glob.glob("**/*.py", recursive=True)
+        if os.path.abspath(fn) != me
+    )
 
 def parse_expected_xlsx(path):
     base = os.path.splitext(os.path.basename(path))[0]
-    txt  = open(path, encoding="utf-8", errors="ignore").read()
-    m    = re.search(r'OUTPUT_XLSX\s*=\s*["\'](.+?\.xlsx)["\']', txt)
+    text = open(path, encoding="utf-8", errors="ignore").read()
+    m = re.search(r'OUTPUT_XLSX\s*=\s*["\'](.+?\.xlsx)["\']', text)
     return m.group(1) if m else f"{base}.xlsx"
 
 def run_script(path):
     xlsx = parse_expected_xlsx(path)
-    # Run in project root so input.txt is found
     proc = subprocess.run(
         [sys.executable, path],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, env=ENV, errors="replace"
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=ENV,
+        errors="replace"
     )
     log = proc.stdout
+
     # find summary line
     summary = "[no summary found]"
     for ln in log.splitlines():
         if SUMMARY_RE.search(ln):
             summary = ln.strip()
             break
+
     # extract hits
     mh = HITS_RE.search(summary)
     hits = int(mh.group(1)) if mh else 0
+
     # collect parse failure lines
     pf_lines = []
     in_pf = False
@@ -65,27 +73,27 @@ def run_script(path):
                 pf_lines.append(ln.strip())
             else:
                 break
+
     # did .xlsx appear?
-    missing = not os.path.isfile(xlsx)
+    exists = os.path.isfile(xlsx)
     return {
-        "basename": os.path.splitext(os.path.basename(path))[0],
-        "returncode": proc.returncode,
-        "xlsx": xlsx,
-        "missing": missing,
-        "hits": hits,
-        "summary": summary,
-        "parse_failures": pf_lines,
-        "log": log
+        "basename":      os.path.splitext(os.path.basename(path))[0],
+        "xlsx":          xlsx,
+        "exists":        exists,
+        "hits":          hits,
+        "summary":       summary,
+        "parse_failures":pf_lines,
+        "log":           log
     }
 
 def main():
     base = os.path.dirname(os.path.abspath(__file__))
     os.chdir(base)
 
-    p = argparse.ArgumentParser()
-    p.add_argument("-c","--combined",default="combined_output.xlsx")
-    p.add_argument("-j","--max-parallel",type=int,default=3)
-    args = p.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-c","--combined",default="combined_output.xlsx")
+    parser.add_argument("-j","--max-parallel",type=int,default=3)
+    args = parser.parse_args()
 
     scripts = find_scripts()
     safe_print(f"Found {len(scripts)} scripts.\n")
@@ -109,34 +117,30 @@ def main():
             total_hits += res["hits"]
             name = res["basename"]
 
-            # Status
-            if res["returncode"] != 0:
-                safe_print(f"[ERROR] {name} exited {res['returncode']}")
-            elif res["missing"]:
+            # Only check whether xlsx exists
+            if not res["exists"]:
                 safe_print(f"[WARN]  {name} missing {res['xlsx']}")
             else:
                 safe_print(f"[OK]    {name}")
 
-            # Summary
+            # print summary
             safe_print("  " + res["summary"])
-
-            # JSON parse failures
+            # print JSON parse failures
             for pf in res["parse_failures"]:
                 safe_print("   " + pf)
 
-            # Move outputs
-            if res["returncode"] == 0 and not res["missing"]:
+            # move outputs
+            if res["exists"]:
                 # move xlsx
-                if os.path.isfile(res["xlsx"]):
-                    shutil.move(res["xlsx"], os.path.join(out_dir, res["xlsx"]))
-                # move docx if exists
+                shutil.move(res["xlsx"], os.path.join(out_dir, res["xlsx"]))
+                # move docx if present
                 docx = res["xlsx"][:-5] + ".docx"
                 if os.path.isfile(docx):
                     shutil.move(docx, os.path.join(out_dir, os.path.basename(docx)))
 
     total = len(results)
-    ok = sum(1 for r in results if r["returncode"]==0 and not r["missing"])
-    safe_print(f"\nScripts run: {total}, succeeded: {ok}, failed/skipped: {total-ok}")
+    ok = sum(1 for r in results if r["exists"])
+    safe_print(f"\nScripts run: {total}, produced XLSX: {ok}, missing: {total-ok}")
     safe_print(f"Grand total hits: {total_hits}\n")
 
     excels = sorted(f for f in os.listdir(out_dir) if f.endswith(".xlsx"))
@@ -155,7 +159,7 @@ def main():
             except Exception:
                 writer.book.add_worksheet(sheet)
 
-    safe_print(f"\nMaster workbook: {os.path.abspath(args.combined)}")
+    safe_print(f"\nMaster workbook created: {os.path.abspath(args.combined)}")
     safe_print(f"All outputs in: {os.path.abspath(out_dir)}")
     sys.exit(0 if ok==total else 1)
 
