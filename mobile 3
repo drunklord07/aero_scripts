@@ -116,19 +116,25 @@ def process_chunk(args):
         # Word output
         para = doc.add_paragraph(f"{set_name} | {key} | ")
         para.add_run(raw_json.replace("\n"," "))
+######
         for num, _ in record_hits:
-            run = para.add_run(f" | {num}")
-            run.font.color.rgb = RGBColor(255,0,0)
-            field = ""
-            for path, v in flat.items():
-                txt = json.dumps(v) if isinstance(v,(dict,list)) else str(v)
-                if num in txt:
-                    field = path
-                    break
-            run2 = para.add_run(f" | field: {field}")
-            run2.font.color.rgb = RGBColor(255,0,0)
-            rows.append((set_name, key, raw_json, num, field))
-        hits += len(record_hits)
+    hits += 1
+    run1 = para.add_run(f" | {num}")
+    run1.font.color.rgb = RGBColor(255,0,0)
+
+    # gather every JSON path containing this number
+    matched_fields = [
+        path
+        for path, v in flat.items()
+        if num in (json.dumps(v) if isinstance(v, (dict, list)) else str(v))
+    ] or [""]
+
+    # one run & one row per field
+    for field in matched_fields:
+        run2 = para.add_run(f" | field: {field}")
+        run2.font.color.rgb = RGBColor(255,0,0)
+        rows.append((set_name, key, raw_json, num, field))
+#####
 
     if rows:
         os.makedirs(TEMP_DIR, exist_ok=True)
