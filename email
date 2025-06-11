@@ -125,19 +125,27 @@ def process_chunk(args):
         para.add_run(raw_json.replace("\n", " "))
 
         for email, _ in sorted(this_hits, key=lambda x: x[1][0]):
+            # highlight email in Word
             hits += 1
             run1 = para.add_run(f" | {email}")
             run1.font.color.rgb = RGBColor(255, 0, 0)
-            # find field path
-            field = ""
+
+            # collect *all* JSON paths that contain this email
+            matched_fields = []
             for path, v in flat.items():
                 txt = json.dumps(v) if isinstance(v, (dict, list)) else str(v)
                 if email in txt:
-                    field = path
-                    break
-            run2 = para.add_run(f" | field: {field}")
-            run2.font.color.rgb = RGBColor(255, 0, 0)
-            rows.append((set_name, key, raw_json, email, field))
+                    matched_fields.append(path)
+
+            # if no JSON field matched, emit an empty field
+            if not matched_fields:
+                matched_fields = [""]
+
+            # emit one run + one Excel row per matching field
+            for field in matched_fields:
+                run2 = para.add_run(f" | field: {field}")
+                run2.font.color.rgb = RGBColor(255, 0, 0)
+                rows.append((set_name, key, raw_json, email, field))
 
     if rows:
         os.makedirs(TEMP_DIR, exist_ok=True)
