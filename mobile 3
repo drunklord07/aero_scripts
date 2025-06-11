@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os
 import re
 import json
@@ -104,37 +105,39 @@ def process_chunk(args):
         values = [json.dumps(v) if isinstance(v,(dict,list)) else str(v)
                   for v in flat.values()]
 
-        record_hits = []
-        for m in pat.finditer(raw_json):
-            num = m.group(1)
-            if any(num in val for val in values):
-                record_hits.append((num, m.span(1)))
+        record_hits = [
+            (m.group(1), m.span(1))
+            for m in pat.finditer(raw_json)
+            if any(m.group(1) in val for val in values)
+        ]
         if not record_hits:
             continue
 
         had_phone += 1
-        # Word output
         para = doc.add_paragraph(f"{set_name} | {key} | ")
         para.add_run(raw_json.replace("\n"," "))
-######
+
+        # —— NEW: capture all fields per phone —— 
         for num, _ in record_hits:
-    hits += 1
-    run1 = para.add_run(f" | {num}")
-    run1.font.color.rgb = RGBColor(255,0,0)
+            hits += 1
+            run1 = para.add_run(f" | {num}")
+            run1.font.color.rgb = RGBColor(255,0,0)
 
-    # gather every JSON path containing this number
-    matched_fields = [
-        path
-        for path, v in flat.items()
-        if num in (json.dumps(v) if isinstance(v, (dict, list)) else str(v))
-    ] or [""]
+            # find every JSON path that contains this number
+            matched = []
+            for path, v in flat.items():
+                txt = json.dumps(v) if isinstance(v,(dict,list)) else str(v)
+                if num in txt:
+                    matched.append(path)
+            if not matched:
+                matched = [""]
 
-    # one run & one row per field
-    for field in matched_fields:
-        run2 = para.add_run(f" | field: {field}")
-        run2.font.color.rgb = RGBColor(255,0,0)
-        rows.append((set_name, key, raw_json, num, field))
-#####
+            # emit one run + row per matched field
+            for fld in matched:
+                run2 = para.add_run(f" | field: {fld}")
+                run2.font.color.rgb = RGBColor(255,0,0)
+                rows.append((set_name, key, raw_json, num, fld))
+        # —— end NEW block —— 
 
     if rows:
         os.makedirs(TEMP_DIR, exist_ok=True)
@@ -151,11 +154,11 @@ def merge_word():
         sub = Document(os.path.join(TEMP_DIR, fn))
         for para in sub.paragraphs:
             out = merged.add_paragraph()
-            for run in para.runs:
-                nr = out.add_run(run.text)
-                if run.font.color and run.font.color.rgb:
-                    nr.font.color.rgb = run.font.color.rgb
-                nr.bold, nr.italic, nr.underline = run.bold, run.italic, run.underline
+            for r in para.runs:
+                nr = out.add_run(r.text)
+                if r.font.color and r.font.color.rgb:
+                    nr.font.color.rgb = r.font.color.rgb
+                nr.bold, nr.italic, nr.underline = r.bold, r.italic, r.underline
     merged.save(OUTPUT_DOCX)
 
 
@@ -197,10 +200,11 @@ if __name__ == "__main__":
     mgr = Manager()
     results = mgr.list()
     chunks = list(chunk_records(records))
-    with Pool(min(len(chunks), cpu_count())) as pool:
+    with Pool(min(cpu_count(), len(chunks))) as pool:
         list(tqdm(
             pool.imap_unordered(process_chunk,
-                [(chunk, idx, results) for chunk, idx in chunks]),
+                [(chunk, idx, results) for chunk, idx in chunks]
+            ),
             total=len(chunks),
             desc="Processing records",
         ))
@@ -211,10 +215,10 @@ if __name__ == "__main__":
     parse_errors = []
     for rows, seen, had_phone, hits, pfail, pfails in results:
         all_rows.extend(rows)
-        total_seen += seen
+        total_seen      += seen
         total_had_phone += had_phone
-        total_hits += hits
-        total_pf += pfail
+        total_hits      += hits
+        total_pf        += pfail
         parse_errors.extend(pfails)
 
     # Summary
