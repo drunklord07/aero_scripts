@@ -111,37 +111,35 @@ def process_chunk(args):
             for v in flat.values()
         ]
 
-        this_hits = []
-        for m in pat.finditer(raw_json):
-            email = m.group(1)
-            if any(email in v for v in values):
-                this_hits.append((email, m.span(1)))
+        this_hits = [
+            (m.group(1), m.span(1))
+            for m in pat.finditer(raw_json)
+            if any(m.group(1) in v for v in values)
+        ]
         if not this_hits:
             continue
 
         with_email += 1
-        # Word output
         para = doc.add_paragraph(f"{set_name} | {key} | ")
         para.add_run(raw_json.replace("\n", " "))
 
+        # NEW LOOP: highlight email and capture all matching fields
         for email, _ in sorted(this_hits, key=lambda x: x[1][0]):
-            # highlight email in Word
             hits += 1
             run1 = para.add_run(f" | {email}")
             run1.font.color.rgb = RGBColor(255, 0, 0)
 
-            # collect *all* JSON paths that contain this email
+            # find all JSON paths containing this email
             matched_fields = []
             for path, v in flat.items():
                 txt = json.dumps(v) if isinstance(v, (dict, list)) else str(v)
                 if email in txt:
                     matched_fields.append(path)
 
-            # if no JSON field matched, emit an empty field
             if not matched_fields:
                 matched_fields = [""]
 
-            # emit one run + one Excel row per matching field
+            # emit one run + Excel row per matched field
             for field in matched_fields:
                 run2 = para.add_run(f" | field: {field}")
                 run2.font.color.rgb = RGBColor(255, 0, 0)
