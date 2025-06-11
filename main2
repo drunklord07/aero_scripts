@@ -20,11 +20,8 @@ def safe_print(*args, **kwargs):
 ENV = os.environ.copy()
 ENV["PYTHONIOENCODING"] = "utf-8"
 
-# Summary‐line and hits‐extraction regexes
-SUMMARY_LINE_RE = re.compile(
-    r"^Scanned\s+\d+\s+records,.*?hits.*$",
-    re.IGNORECASE | re.MULTILINE
-)
+# Extractor summary regex
+SUMMARY_LINE_RE = re.compile(r"Scanned\s+\d+\s+records,.*?hits", re.IGNORECASE)
 HITS_EXTRACT_RE = re.compile(r",\s*(\d+)\s+.*?hits", re.IGNORECASE)
 
 def find_scripts():
@@ -36,13 +33,12 @@ def find_scripts():
 
 def parse_expected_xlsx(path):
     base = os.path.splitext(os.path.basename(path))[0]
-    text = open(path, encoding="utf-8", errors="ignore").read()
-    m = re.search(r'OUTPUT_XLSX\s*=\s*["\'](.+?\.xlsx)["\']', text)
+    txt  = open(path, encoding="utf-8", errors="ignore").read()
+    m    = re.search(r'OUTPUT_XLSX\s*=\s*["\'](.+?\.xlsx)["\']', txt)
     return m.group(1) if m else f"{base}.xlsx"
 
 def run_script(path):
-    # Always run in base dir so input.txt is found
-    exp_xlsx = parse_expected_xlsx(path)
+    xlsx = parse_expected_xlsx(path)
     proc = subprocess.run(
         [sys.executable, path],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -50,19 +46,22 @@ def run_script(path):
     )
     log = proc.stdout
 
-    # Extract summary line
-    mline = SUMMARY_LINE_RE.search(log)
-    summary = mline.group(0) if mline else "[no summary found]"
+    # find summary line
+    summary = "[no summary found]"
+    for ln in log.splitlines():
+        if "records" in ln.lower() and "hits" in ln.lower():
+            summary = ln.strip()
+            break
 
-    # Extract hits count
+    # extract hits
     mh = HITS_EXTRACT_RE.search(summary)
     hits = int(mh.group(1)) if mh else 0
 
-    missing = not os.path.isfile(exp_xlsx)
+    missing = not os.path.isfile(xlsx)
     return {
         "basename": os.path.splitext(os.path.basename(path))[0],
         "returncode": proc.returncode,
-        "xlsx": exp_xlsx,
+        "xlsx": xlsx,
         "missing": missing,
         "hits": hits,
         "summary": summary,
@@ -73,9 +72,9 @@ def main():
     base_dir = os.path.dirname(os.path.abspath(__file__))
     os.chdir(base_dir)
 
-    parser = argparse.ArgumentParser(description="Run extractors & merge Excel outputs")
-    parser.add_argument("-c","--combined", default="combined_output.xlsx")
-    parser.add_argument("-j","--max-parallel", type=int, default=3)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-c","--combined",default="combined_output.xlsx")
+    parser.add_argument("-j","--max-parallel",type=int,default=3)
     args = parser.parse_args()
 
     scripts = find_scripts()
@@ -88,37 +87,43 @@ def main():
 
     total_hits = 0
     results = []
-    with ThreadPoolExecutor(max_workers=args.max_parallel) as exe:
-        futures = {exe.submit(run_script, s): s for s in scripts}
-        for fut in tqdm(as_completed(futures),
-                        total=len(futures),
-                        desc="Running scripts",
-                        ascii=True):
-            res = fut.result()
-            results.append(res)
-            total_hits += res["hits"]
-            name = res["basename"]
+    for fut in tqdm(ThreadPoolExecutor(max_workers=args.max_parallel)
+                    .map(lambda s: run_script(s), scripts),
+                    total=len(scripts),
+                    desc="Running scripts",
+                    ascii=True):
+        res = fut
+        results.append(res)
+        total_hits += res["hits"]
+        name = res["basename"]
 
-            # print status tag
-            if res["returncode"] != 0:
-                safe_print(f"[ERROR] {name} exited {res['returncode']}")
-            elif res["missing"]:
-                safe_print(f"[WARN]  {name} missing {res['xlsx']}")
-            else:
-                safe_print(f"[OK]    {name}")
+        # status
+        if res["returncode"] != 0:
+            safe_print(f"[ERROR] {name} exited {res['returncode']}")
+        elif res["missing"]:
+            safe_print(f"[WARN]  {name} missing {res['xlsx']}")
+        else:
+            safe_print(f"[OK]    {name}")
 
-            # print its own summary line
-            safe_print("  " + res["summary"])
+        # summary
+        safe_print(f"  {res['summary']}")
 
-            # copy outputs (xlsx + docx) into outputs/
-            if not res["missing"] and res["returncode"] == 0:
-                src_x = res["xlsx"]
-                dst_x = os.path.join(outputs, os.path.basename(src_x))
-                if os.path.isfile(src_x):
-                    shutil.copy(src_x, dst_x)
-                src_d = os.path.splitext(src_x)[0] + ".docx"
-                if os.path.isfile(src_d):
-                    shutil.copy(src_d, os.path.join(outputs, os.path.basename(src_d)))
+        # JSON parse failures block
+        in_fail = False
+        for ln in res["log"].splitlines():
+            if "json parse failure" in ln.lower():
+                in_fail = True
+                safe_print(f"  {ln.strip()}")
+            elif in_fail and ln.startswith("  "):
+                safe_print(f"  {ln.strip()}")
+            elif in_fail:
+                break
+
+        # copy artifacts
+        if res["returncode"] == 0 and not res["missing"]:
+            for fn in (res["xlsx"], res["xlsx"][:-5] + ".docx"):
+                if os.path.isfile(fn):
+                    shutil.copy(fn, outputs)
 
     total = len(results)
     ok = sum(1 for r in results if r["returncode"]==0 and not r["missing"])
@@ -134,17 +139,17 @@ def main():
     with pd.ExcelWriter(args.combined, engine="xlsxwriter") as writer:
         for fname in tqdm(excels, desc="Merging", ascii=True):
             path = os.path.join(outputs, fname)
+            sheet = os.path.splitext(fname)[0][:31]
             try:
-                df = pd.read_excel(path)
+                df = pd.read_excel(path, dtype=str)
+                df.to_excel(writer, sheet_name=sheet, index=False)
             except Exception as e:
                 safe_print(f"[WARN] could not read {fname}: {e}")
-                continue
-            sheet = os.path.splitext(fname)[0][:31]
-            df.to_excel(writer, sheet_name=sheet, index=False)
+                writer.book.add_worksheet(sheet)
 
-    safe_print(f"\nMaster workbook created: {os.path.abspath(args.combined)}")
+    safe_print(f"\nMaster workbook: {os.path.abspath(args.combined)}")
     safe_print(f"All outputs in: {os.path.abspath(outputs)}")
     sys.exit(0 if ok==total else 1)
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
