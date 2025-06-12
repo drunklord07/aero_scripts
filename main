@@ -1,130 +1,495 @@
 #!/usr/bin/env python3
 import os
-import glob
 import re
-import subprocess
-import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-import pandas as pd
+import json
+import shutil
+import sys
+from multiprocessing import Pool, Manager, cpu_count
+from docx import Document
+from docx.shared import RGBColor
+import xlsxwriter
 from tqdm import tqdm
 
-def find_scripts():
-    """Find all .py files (recursively) except this driver script itself."""
-    me = os.path.abspath(__file__)
-    scripts = []
-    for fn in glob.glob("**/*.py", recursive=True):
-        full = os.path.abspath(fn)
-        if full != me:
-            scripts.append(fn)
-    return sorted(scripts)
+# === CONFIG ===
+INPUT_FILE   = "input.txt"
+CHUNK_SIZE   = 2000
+OUTPUT_DOCX  = "aerospike_cards.docx"
+OUTPUT_XLSX  = "aerospike_cards.xlsx"
+TEMP_DIR     = "temp_aero_card_parts"
 
-def parse_expected_outputs(script_path):
-    """
-    Peek at the script source and extract OUTPUT_XLSX / OUTPUT_DOCX.
-    Fall back to <basename>.xlsx/.docx if not found.
-    """
-    base = os.path.splitext(os.path.basename(script_path))[0]
-    text = open(script_path, encoding="utf-8", errors="ignore").read()
-    m_x = re.search(r'OUTPUT_XLSX\s*=\s*["\'](.+?\.xlsx)["\']', text)
-    m_d = re.search(r'OUTPUT_DOCX\s*=\s*["\'](.+?\.docx)["\']', text)
-    xlsx = m_x.group(1) if m_x else f"{base}.xlsx"
-    docx = m_d.group(1) if m_d else f"{base}.docx"
-    return xlsx, docx
+# Combined Visa, MasterCard, Amex and RuPay (exact lengths) with word boundaries
+CARD_REGEX   = r'\b((?:' \
+               r'4[0-9]{12}(?:[0-9]{3})?' \
+               r'|' \
+               r'5[1-5][0-9]{14}' \
+               r'|' \
+               r'2(?:2[2-9][0-9]{12}|[3-6][0-9]{13}|7(?:[01][0-9]{12}|20[0-9]{12}))' \
+               r'|' \
+               r'3[47][0-9]{13}' \
+               r'|' \
+               r'60[0-9]{14}' \
+               r'|' \
+               r'65[0-9]{14}' \
+               r'|' \
+               r'81[0-9]{14}' \
+               r'|' \
+               r'508[0-9][0-9]{12}' \
+               r'))\b'
 
-def run_script(path):
-    """
-    Run `python path` from the top-level cwd.
-    Capture stdout/stderr. Return a dict with:
-      - path, basename
-      - returncode
-      - expected_xlsx, expected_docx
-      - missing: list of missing outputs
-      - log
-    """
-    base = os.path.splitext(os.path.basename(path))[0]
-    exp_xlsx, exp_docx = parse_expected_outputs(path)
+def flatten_json(obj, prefix=""):
+    flat = {}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            path = f"{prefix}{k}"
+            if isinstance(v, (dict, list)):
+                flat.update(flatten_json(v, path + "."))
+            else:
+                flat[path] = v
+    elif isinstance(obj, list):
+        for i, item in enumerate(obj):
+            flat.update(flatten_json(item, f"{prefix}[{i}]."))
+    return flat
 
-    proc = subprocess.run(
-        ["python", path],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True
+def load_records():
+    """
+    Single-pass header + brace-scanning loader.
+    Returns records, warning count, skipped headers.
+    """
+    text = open(INPUT_FILE, encoding="utf-8", errors="ignore").read()
+    header_pat = re.compile(
+        r"Set\s+Name\s*:\s*(?P<set>[^,]+)"
+        r"(?:\s*,\s*Key\s*:\s*(?P<key>[^,]+))?"
+        r".*?JSON\s*Data\s*:",
+        flags=re.IGNORECASE
     )
 
-    missing = []
-    for fn in (exp_docx, exp_xlsx):
-        if not os.path.exists(fn):
-            missing.append(fn)
+    records, skipped, warnings = [], [], 0
+    pos, L = 0, len(text)
+    while True:
+        m = header_pat.search(text, pos)
+        if not m:
+            break
+        set_name = m.group("set").strip()
+        key      = (m.group("key") or "").strip()
+        brace_i  = text.find("{", m.end())
+        if brace_i < 0:
+            warnings += 1
+            skipped.append((set_name, key, "no opening brace"))
+            pos = m.end()
+            continue
+        count, i = 1, brace_i + 1
+        while i < L and count:
+            if text[i] == "{":
+                count += 1
+            elif text[i] == "}":
+                count -= 1
+            i += 1
+        if count:
+            warnings += 1
+            skipped.append((set_name, key, "unbalanced braces"))
+            pos = m.end()
+            continue
+        raw_json = text[brace_i:i]
+        records.append((set_name, key, raw_json))
+        pos = i
 
-    return {
-        "path": path,
-        "basename": base,
-        "returncode": proc.returncode,
-        "expected_xlsx": exp_xlsx,
-        "expected_docx": exp_docx,
-        "missing": missing,
-        "log": proc.stdout
-    }
+    return records, warnings, skipped
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Run all extractor scripts in parallel and merge their XLSX outputs."
-    )
-    parser.add_argument(
-        "-c", "--combined", default="combined_output.xlsx",
-        help="Name of the master Excel file (default: combined_output.xlsx)"
-    )
-    parser.add_argument(
-        "-j", "--max-parallel", type=int, default=3,
-        help="Number of scripts to run concurrently"
-    )
-    args = parser.parse_args()
+def chunk_records(records):
+    for idx in range(0, len(records), CHUNK_SIZE):
+        yield records[idx:idx+CHUNK_SIZE], idx//CHUNK_SIZE
 
-    scripts = find_scripts()
-    print(f"Found {len(scripts)} Python scripts to run.\n")
+def process_chunk(args):
+    chunk, idx, result_list = args
+    pat = re.compile(CARD_REGEX)
+    doc = Document()
+    rows, parse_errors = [], []
+    seen = had_card = hits = parse_fail = 0
 
-    results = []
-    with ThreadPoolExecutor(max_workers=args.max_parallel) as pool:
-        futures = { pool.submit(run_script, s): s for s in scripts }
-        for fut in tqdm(as_completed(futures),
-                        total=len(futures),
-                        desc="Running scripts",
-                        ascii=True):
-            res = fut.result()
-            results.append(res)
+    for set_name, key, raw_json in chunk:
+        seen += 1
+        try:
+            obj  = json.loads(raw_json)
+            flat = flatten_json(obj)
+        except json.JSONDecodeError:
+            parse_fail += 1
+            parse_errors.append((set_name, key, raw_json))
+            continue
 
-            if res["returncode"] != 0:
-                print(f"[ERROR] {res['path']} exited {res['returncode']}")
-                print(res["log"])
-            elif res["missing"]:
-                print(f"[WARN] {res['path']} missing outputs: {res['missing']}")
+        values = [
+            json.dumps(v) if isinstance(v,(dict,list)) else str(v)
+            for v in flat.values()
+        ]
 
-    total = len(results)
-    succeeded = sum(1 for r in results if r["returncode"] == 0 and not r["missing"])
-    print(f"\nScripts run: {total}, succeeded: {succeeded}, failed/skipped: {total - succeeded}\n")
+        record_hits = [
+            (m.group(1), m.span(1))
+            for m in pat.finditer(raw_json)
+            if any(m.group(1) in val for val in values)
+        ]
+        if not record_hits:
+            continue
 
-    # Gather only the XLSX files that were actually produced
-    excels = [
-        r["expected_xlsx"] 
-        for r in results
-        if r["returncode"] == 0
-        and not r["missing"]
-        and os.path.exists(r["expected_xlsx"])
-    ]
+        had_card += 1
+        para = doc.add_paragraph(f"{set_name} | {key} | ")
+        para.add_run(raw_json.replace("\n"," "))
 
-    if not excels:
-        print("No Excel files to merge. Exiting.")
-        return
+        # —— NEW: capture all fields per card number —— 
+        for card_num, _ in record_hits:
+            hits += 1
+            run1 = para.add_run(f" | {card_num}")
+            run1.font.color.rgb = RGBColor(255,0,0)
 
-    print(f"Merging {len(excels)} Excel files into '{args.combined}' ...")
-    with pd.ExcelWriter(args.combined, engine="xlsxwriter") as writer:
-        for f in tqdm(excels, desc="Merging sheets", ascii=True):
-            df = pd.read_excel(f)
-            sheet = os.path.splitext(os.path.basename(f))[0][:31]
-            df.to_excel(writer, sheet_name=sheet, index=False)
+            # find every JSON path containing this card_num
+            matched = [
+                path
+                for path, v in flat.items()
+                if card_num in (json.dumps(v) if isinstance(v,(dict,list)) else str(v))
+            ] or [""]
 
-    print(f"\nMaster workbook created: {args.combined}")
+            # emit one run + one row per matched field
+            for fld in matched:
+                run2 = para.add_run(f" | field: {fld}")
+                run2.font.color.rgb = RGBColor(255,0,0)
+                rows.append((set_name, key, raw_json, card_num, fld))
+        # —— end NEW block —— 
+
+    if rows:
+        os.makedirs(TEMP_DIR, exist_ok=True)
+        doc.save(os.path.join(TEMP_DIR, f"chunk_{idx}.docx"))
+
+    result_list.append((rows, seen, had_card, hits, parse_fail, parse_errors))
+
+def merge_word():
+    merged = Document()
+    for fn in tqdm(sorted(os.listdir(TEMP_DIR)), desc="Merging Word"):
+        if not fn.endswith(".docx"): continue
+        sub = Document(os.path.join(TEMP_DIR, fn))
+        for para in sub.paragraphs:
+            out = merged.add_paragraph()
+            for r in para.runs:
+                nr = out.add_run(r.text)
+                if r.font.color and r.font.color.rgb:
+                    nr.font.color.rgb = r.font.color.rgb
+                nr.bold, nr.italic, nr.underline = r.bold, r.italic, r.underline
+    merged.save(OUTPUT_DOCX)
+
+def write_excel(rows, parse_errors):
+    wb = xlsxwriter.Workbook(OUTPUT_XLSX)
+    ws = wb.add_worksheet("Results")
+    red = wb.add_format({"font_color":"red"})
+
+    # Write matches
+    ws.write_row(0, 0, ["Set Name","Key","Full JSON","Card","Field"])
+    r = 1
+    for a,b,c,num,f in rows:
+        ws.write(r,0,a); ws.write(r,1,b); ws.write(r,2,c)
+        ws.write(r,3,num,red); ws.write(r,4,f)
+        r += 1
+
+    # Two blank lines
+    r += 1
+
+    # Write parse failures
+    ws.write_row(r, 0, ["Parse Failures:"])
+    r += 1
+    ws.write_row(r, 0, ["Set Name","Key","Raw JSON"])
+    r += 1
+    for a,b,raw in parse_errors:
+        ws.write(r,0,a); ws.write(r,1,b); ws.write(r,2,raw)
+        r += 1
+
+    wb.close()
 
 if __name__ == "__main__":
-    main()
+    # Load
+    print("Loading Aerospike records …")
+    records, warn_count, skipped = load_records()
+    print(f"→ Total records loaded: {len(records)}  (warnings: {warn_count})")
+
+    # Process
+    mgr     = Manager()
+    results = mgr.list()
+    chunks  = list(chunk_records(records))
+    with Pool(min(cpu_count(), len(chunks))) as pool:
+        list(tqdm(
+            pool.imap_unordered(process_chunk,
+                [(chunk, idx, results) for chunk, idx in chunks]
+            ),
+            total=len(chunks),
+            desc="Processing records",
+        ))
+
+    # Aggregate
+    all_rows        = []
+    total_seen      = total_had_card = total_hits = total_pf = 0
+    parse_errors    = []
+    for rows, seen, had_card, hits, pfail, pfails in results:
+        all_rows.extend(rows)
+        total_seen      += seen
+        total_had_card  += had_card
+        total_hits      += hits
+        total_pf        += pfail
+        parse_errors.extend(pfails)
+
+    # Summary
+    print(
+        f"\nScanned {total_seen} records, "
+        f"{total_had_card} had card numbers, "
+        f"{total_hits} total hits, "
+        f"{total_pf} JSON parse failures"
+    )
+
+    # Output
+    if os.path.isdir(TEMP_DIR) and total_hits > 0:
+        merge_word()
+    write_excel(all_rows, parse_errors)
+    if os.path.isdir(TEMP_DIR):
+        shutil.rmtree(TEMP_DIR)
+
+    print(f"\n→ Word saved: {OUTPUT_DOCX}")
+    print(f"→ Excel saved: {OUTPUT_XLSX}\n")
+    sys.exit(0 if total_hits > 0 and total_pf == 0 else 1)
+################################################################################
+
+#!/usr/bin/env python3
+import os
+import re
+import json
+import shutil
+import sys
+from multiprocessing import Pool, Manager, cpu_count
+from docx import Document
+from docx.shared import RGBColor
+import xlsxwriter
+from tqdm import tqdm
+
+# === CONFIG ===
+INPUT_FILE   = "input.txt"
+CHUNK_SIZE   = 2000
+OUTPUT_DOCX  = "aerospike_cards.docx"
+OUTPUT_XLSX  = "aerospike_cards.xlsx"
+TEMP_DIR     = "temp_aero_card_parts"
+
+# Combined Visa, MasterCard, Amex or RuPay allowing spaces or hyphens between 4-digit groups
+CARD_REGEX = (
+    r'\b('
+      # Visa: 4xxx (3×(sep+4 digits)) 
+      r'4[0-9]{3}(?:[-\s]?[0-9]{4}){3}'
+    r'|'
+      # MasterCard: 51–55 or 2221–2720, then 3×(sep+4 digits)
+      r'(?:5[1-5][0-9]{2}|2(?:2[2-9][0-9]|[3-6][0-9]{2}|7(?:[01][0-9]|20))[0-9])'
+      r'(?:[-\s]?[0-9]{4}){3}'
+    r'|'
+      # Amex: 34/37 +2 digits + sep +6 digits + sep +5 digits
+      r'3[47][0-9]{2}[-\s]?[0-9]{6}[-\s]?[0-9]{5}'
+    r'|'
+      # RuPay: BINs 60xx, 65xx, 81xx, or 508x + 3×(sep+4 digits)
+      r'(?:60[0-9]{2}|65[0-9]{2}|81[0-9]{2}|508[0-9]{2})(?:[-\s]?[0-9]{4}){3}'
+    r')\b'
+)
+
+def flatten_json(obj, prefix=""):
+    flat = {}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            path = f"{prefix}{k}"
+            if isinstance(v, (dict, list)):
+                flat.update(flatten_json(v, path + "."))
+            else:
+                flat[path] = v
+    elif isinstance(obj, list):
+        for i, item in enumerate(obj):
+            flat.update(flatten_json(item, f"{prefix}[{i}]."))
+    return flat
+
+def load_records():
+    """
+    Single-pass header + brace-scanning loader.
+    Returns records, warning count, skipped headers.
+    """
+    text = open(INPUT_FILE, encoding="utf-8", errors="ignore").read()
+    header_pat = re.compile(
+        r"Set\s+Name\s*:\s*(?P<set>[^,]+)"
+        r"(?:\s*,\s*Key\s*:\s*(?P<key>[^,]+))?"
+        r".*?JSON\s*Data\s*:",
+        flags=re.IGNORECASE
+    )
+
+    records, skipped, warnings = [], [], 0
+    pos, L = 0, len(text)
+    while True:
+        m = header_pat.search(text, pos)
+        if not m:
+            break
+        set_name = m.group("set").strip()
+        key      = (m.group("key") or "").strip()
+        brace_i  = text.find("{", m.end())
+        if brace_i < 0:
+            warnings += 1
+            skipped.append((set_name, key, "no opening brace"))
+            pos = m.end()
+            continue
+        count, i = 1, brace_i + 1
+        while i < L and count:
+            if text[i] == "{":
+                count += 1
+            elif text[i] == "}":
+                count -= 1
+            i += 1
+        if count:
+            warnings += 1
+            skipped.append((set_name, key, "unbalanced braces"))
+            pos = m.end()
+            continue
+        raw_json = text[brace_i:i]
+        records.append((set_name, key, raw_json))
+        pos = i
+
+    return records, warnings, skipped
+
+def chunk_records(records):
+    for idx in range(0, len(records), CHUNK_SIZE):
+        yield records[idx:idx+CHUNK_SIZE], idx//CHUNK_SIZE
+
+def process_chunk(args):
+    chunk, idx, result_list = args
+    pat = re.compile(CARD_REGEX)
+    doc = Document()
+    rows, parse_errors = [], []
+    seen = had_card = hits = parse_fail = 0
+
+    for set_name, key, raw_json in chunk:
+        seen += 1
+        try:
+            obj  = json.loads(raw_json)
+            flat = flatten_json(obj)
+        except json.JSONDecodeError:
+            parse_fail += 1
+            parse_errors.append((set_name, key, raw_json))
+            continue
+
+        values = [
+            json.dumps(v) if isinstance(v,(dict,list)) else str(v)
+            for v in flat.values()
+        ]
+
+        record_hits = [
+            (m.group(1), m.span(1))
+            for m in pat.finditer(raw_json)
+            if any(m.group(1) in val for val in values)
+        ]
+        if not record_hits:
+            continue
+
+        had_card += 1
+        para = doc.add_paragraph(f"{set_name} | {key} | ")
+        para.add_run(raw_json.replace("\n"," "))
+
+        # capture all fields per card number
+        for card_num, _ in record_hits:
+            hits += 1
+            run1 = para.add_run(f" | {card_num}")
+            run1.font.color.rgb = RGBColor(255,0,0)
+
+            matched = [
+                path
+                for path, v in flat.items()
+                if card_num in (json.dumps(v) if isinstance(v,(dict,list)) else str(v))
+            ] or [""]
+
+            for fld in matched:
+                run2 = para.add_run(f" | field: {fld}")
+                run2.font.color.rgb = RGBColor(255,0,0)
+                rows.append((set_name, key, raw_json, card_num, fld))
+
+    if rows:
+        os.makedirs(TEMP_DIR, exist_ok=True)
+        doc.save(os.path.join(TEMP_DIR, f"chunk_{idx}.docx"))
+
+    result_list.append((rows, seen, had_card, hits, parse_fail, parse_errors))
+
+def merge_word():
+    merged = Document()
+    for fn in tqdm(sorted(os.listdir(TEMP_DIR)), desc="Merging Word"):
+        if not fn.endswith(".docx"): continue
+        sub = Document(os.path.join(TEMP_DIR, fn))
+        for para in sub.paragraphs:
+            out = merged.add_paragraph()
+            for r in para.runs:
+                nr = out.add_run(r.text)
+                if r.font.color and r.font.color.rgb:
+                    nr.font.color.rgb = r.font.color.rgb
+                nr.bold, nr.italic, nr.underline = r.bold, r.italic, r.underline
+    merged.save(OUTPUT_DOCX)
+
+def write_excel(rows, parse_errors):
+    wb = xlsxwriter.Workbook(OUTPUT_XLSX)
+    ws = wb.add_worksheet("Results")
+    red = wb.add_format({"font_color":"red"})
+
+    # Write matches
+    ws.write_row(0, 0, ["Set Name","Key","Full JSON","Card Number","Field"])
+    r = 1
+    for a,b,c,num,f in rows:
+        ws.write(r,0,a); ws.write(r,1,b); ws.write(r,2,c)
+        ws.write(r,3,num,red); ws.write(r,4,f)
+        r += 1
+
+    # Two blank lines
+    r += 1
+
+    # Write parse failures
+    ws.write_row(r, 0, ["Parse Failures:"])
+    r += 1
+    ws.write_row(r, 0, ["Set Name","Key","Raw JSON"])
+    r += 1
+    for a,b,raw in parse_errors:
+        ws.write(r,0,a); ws.write(r,1,b); ws.write(r,2,raw)
+        r += 1
+
+    wb.close()
+
+if __name__ == "__main__":
+    print("Loading Aerospike records …")
+    records, warn_count, skipped = load_records()
+    print(f"→ Total records loaded: {len(records)}  (warnings: {warn_count})")
+
+    mgr     = Manager()
+    results = mgr.list()
+    chunks  = list(chunk_records(records))
+    with Pool(min(cpu_count(), len(chunks))) as pool:
+        list(tqdm(
+            pool.imap_unordered(process_chunk,
+                [(chunk, idx, results) for chunk, idx in chunks]
+            ),
+            total=len(chunks),
+            desc="Processing records",
+        ))
+
+    all_rows        = []
+    total_seen      = total_had_card = total_hits = total_pf = 0
+    parse_errors    = []
+    for rows, seen, had_card, hits, pfail, pfails in results:
+        all_rows.extend(rows)
+        total_seen      += seen
+        total_had_card  += had_card
+        total_hits      += hits
+        total_pf        += pfail
+        parse_errors.extend(pfails)
+
+    print(
+        f"\nScanned {total_seen} records, "
+        f"{total_had_card} had card numbers, "
+        f"{total_hits} total hits, "
+        f"{total_pf} JSON parse failures"
+    )
+
+    if os.path.isdir(TEMP_DIR) and total_hits > 0:
+        merge_word()
+    write_excel(all_rows, parse_errors)
+    if os.path.isdir(TEMP_DIR):
+        shutil.rmtree(TEMP_DIR)
+
+    print(f"\n→ Word saved: {OUTPUT_DOCX}")
+    print(f"→ Excel saved: {OUTPUT_XLSX}\n")
+    sys.exit(0 if total_hits > 0 and total_pf == 0 else 1)
